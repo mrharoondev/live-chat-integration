@@ -47,7 +47,7 @@ Route::get('/widget-config.js', function () {
 })->name('widget-config');
 
 Route::get('/chat-widget.js', function () {
-    $path = base_path('../web-based-live-chat-widget/chat-widget.js');
+    $path = base_path('chat-widget.js');
     if (!is_file($path)) {
         abort(404);
     }
