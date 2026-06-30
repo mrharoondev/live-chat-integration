@@ -9,6 +9,16 @@ Route::get('/', function () {
     return view('welcome');
 });
 
+Route::get('/widget-test', function () {
+    $apiDomain = rtrim((string) config('services.nilaq.api_domain', ''), '/').'/';
+    $channelId = trim((string) config('services.nilaq.channel_id', ''));
+
+    return response()->view('widget-test', [
+        'apiDomain' => $apiDomain,
+        'channelId' => $channelId,
+    ]);
+})->name('widget-test');
+
 Route::get('/widget-config.js', function () {
     $apiDomain = rtrim((string) config('services.nilaq.api_domain', ''), '/');
     $channelId = trim((string) config('services.nilaq.channel_id', ''));

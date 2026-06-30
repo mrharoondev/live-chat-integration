@@ -33,31 +33,33 @@
 <body>
   <h2>Live Chat Channel — widget test</h2>
   <p>
-    This page loads <code>chat-widget.js</code> against your NilaQ backend using the
-    <strong>Live Chat Channel</strong> live chat channel.
+    This page loads the NilaQ live chat widget against your backend using the
+    <strong>blog-system</strong> channel configuration.
   </p>
 
   <dl class="meta">
-    <dt>Channel name</dt>
-    <dd>Live Chat Channel</dd>
     <dt>Channel number</dt>
-    <dd><code>75215556</code></dd>
+    <dd><code>{{ $channelId }}</code></dd>
     <dt>Backend</dt>
-    <dd><code>http://localhost:8000/</code></dd>
+    <dd><code>{{ $apiDomain }}</code></dd>
     <dt>Agent inbox</dt>
-    <dd><a href="http://localhost:8000/inbox" target="_blank" rel="noopener">http://localhost:8000/inbox</a></dd>
+    <dd><a href="http://localhost:3000/inbox" target="_blank" rel="noopener">http://localhost:3000/inbox</a></dd>
   </dl>
 
-  <p>Open the chat launcher (bottom-left per your widget design), send a message, then reply from the NilaQ inbox.</p>
+  <p>
+    Open the chat launcher, enter your email in pre-chat, then go offline (close tab or wait).
+    When an agent sends a message, you should receive an email alert. Reply to that email — the
+    reply should appear as a normal live chat message in the inbox.
+  </p>
 
   <script>
     window.ChatWidgetConfig = {
-      apiDomain: "http://localhost:8000/",
-      channelId: "75215556",
+      apiDomain: @json($apiDomain),
+      channelId: @json($channelId),
       skipAllowedDomainsCheck: true,
-      onNotify: (msg) => console.log("[Live Chat Channel widget]", msg),
+      onNotify: (msg) => console.log("[Live Chat widget]", msg),
     };
   </script>
-  <script async src="./chat-widget.js"></script>
+  <script async src="{{ route('chat-widget') }}"></script>
 </body>
 </html>

@@ -7,7 +7,7 @@
         const config = window.ChatWidgetConfig || {};
 
         return {
-            apiDomain: config.apiDomain || 'http://127.0.0.1:8000',
+            apiDomain: config.apiDomain || 'https://staging-back.nilaq.com/',
             apiBasePath: '/api/public/livechat',
             channelId: config.channelId || null,
             skipAllowedDomainsCheck: config.skipAllowedDomainsCheck === true,
@@ -268,6 +268,7 @@
         assignedAgent: null,
         assignedAgentPresence: null,
         selectedMessageId: null,
+        highlightedReplyTargetId: null,
         pendingInReplyOf: null,
         editingMessageNumber: null
     };
@@ -285,6 +286,7 @@
             assignedAgent: null,
             assignedAgentPresence: null,
             selectedMessageId: null,
+            highlightedReplyTargetId: null,
             pendingInReplyOf: null,
             editingMessageNumber: null
         };
@@ -1024,18 +1026,18 @@
         injectStyles();
         createWidget();
         initializeWidget();
-        void loadWidgetSettingsOnBoot();
-        // Ensure unread badge updates even if the widget is never opened.
-        // This fixes "messages only appear after refresh" when the widget stays closed.
-        void initializeChatSession(false)
-            .then(function (session) {
-                if (session && session.token) {
-                    queueMicrotask(function () {
-                        startVisitorPageAndPresenceTracking();
-                    });
-                }
-            })
-            .catch(function () {});
+        void Promise.all([
+            loadWidgetSettingsOnBoot(),
+            initializeChatSession(false).catch(function () { return null; })
+        ]).then(function (results) {
+            var session = results[1];
+            if (session && session.token) {
+                queueMicrotask(function () {
+                    startVisitorPageAndPresenceTracking();
+                });
+            }
+            return prefetchMessagesEntryState();
+        }).catch(function () {});
         startUnreadPolling(5000);
         // Bring the WebSocket up at boot so inbound messages push in real time
         // regardless of whether the widget is opened in this session, and re-bind
@@ -1166,21 +1168,32 @@
             }
 
             .cw-msg-header {
-                padding: 0.75rem 0.75rem;
+                padding: 0;
                 background: #fff;
-                border-bottom: 1px solid var(--cw-slate-200);
+                border-bottom: 1px solid #e2e8f0;
                 flex-shrink: 0;
-                min-height: 3rem;
+            }
+            .cw-msg-header-inner {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 0.5rem;
+                padding: 0.5rem 0.5rem;
+                width: 100%;
+                box-sizing: border-box;
             }
             /* Messages header: row layout + icon color (do not rely on Tailwind alone). */
             #mainHeader:not(.hide-on-home) {
+                display: block !important;
+            }
+            #mainHeader:not(.hide-on-home) .cw-msg-header-inner {
                 display: flex !important;
                 flex-direction: row;
                 align-items: center;
                 justify-content: space-between;
                 gap: 0.5rem;
             }
-            #mainHeader:not(.hide-on-home) > div:first-child {
+            #mainHeader:not(.hide-on-home) .cw-msg-header-center {
                 display: flex !important;
                 flex-direction: row;
                 align-items: center;
@@ -1189,8 +1202,20 @@
                 min-width: 0;
             }
             #mainHeader:not(.hide-on-home) button {
-                color: #475569;
+                color: #64748b;
                 flex-shrink: 0;
+                width: 2rem;
+                height: 2rem;
+                border: none;
+                background: transparent;
+                border-radius: 9999px;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+            #mainHeader:not(.hide-on-home) button:hover {
+                background: #f1f5f9;
             }
             #mainHeader:not(.hide-on-home) button svg {
                 display: block;
@@ -1247,6 +1272,9 @@
                 opacity: 0.45;
             }
             /* Selection: highlight the bubble only (not the full row / avatar). */
+            .cw-msg-wrap {
+                width: 100%;
+            }
             .cw-msg-wrap.cw-msg-selected {
                 box-shadow: none;
             }
@@ -1254,128 +1282,194 @@
             .cw-msg-wrap.cw-msg-selected .cw-bubble-out {
                 box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.42);
             }
+            .cw-msg-wrap.cw-msg-reply-target .cw-bubble-in,
+            .cw-msg-wrap.cw-msg-reply-target .cw-bubble-out {
+                box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.65);
+            }
 
-            /* Messages column when active (visibility/display enforced on #cwScreenStage > .chat-widget-screen) */
+            /* Messages screen — Preline conversation layout */
+            .cw-ms-screen {
+                position: relative;
+                display: flex;
+                flex-direction: column;
+                flex: 1;
+                min-height: 0;
+                overflow: hidden;
+                background: #fff;
+            }
             #chatWidget .cw-screen-stage > #messagesScreen.chat-widget-screen.active {
                 min-height: 0;
             }
-            .cw-msg-thread-wrap {
-                flex: 1;
-                min-height: 0;
-                display: flex;
-                flex-direction: column;
-                background: var(--cw-thread-bg);
-                overflow: hidden;
-            }
-            .chat-widget-messages.cw-msg-thread {
+            .cw-ms-scroll {
                 flex: 1;
                 min-height: 0;
                 overflow-y: auto;
-                gap: 0.75rem;
-                padding: 0.75rem 0.75rem 1rem;
+                overflow-x: hidden;
+                -webkit-overflow-scrolling: touch;
             }
-
-            .cw-input-footer {
-                background: #fff;
-                border-top: 1px solid var(--cw-slate-200);
-                padding: 0.65rem 0.75rem 0.75rem;
+            .cw-ms-scroll-inner {
+                padding: 0.5rem 1rem 6.5rem;
             }
-            .cw-input-footer .chat-widget-input-wrapper {
-                border-radius: 0.875rem;
-                border-color: var(--cw-slate-200) !important;
-                background: #fff;
-            }
-            .cw-input-footer .chat-widget-input-wrapper.focused {
-                border-color: rgba(15, 23, 42, 0.22) !important;
-                box-shadow: none;
-            }
-            #chatWidget #chatInput:focus,
-            #chatWidget #chatInput:focus-visible {
-                outline: none !important;
-                box-shadow: none !important;
-            }
-
-            /* Composer toolbar: flex row + icon strokes without Tailwind. */
-            #chatWidget #inputWrapper {
+            .cw-msg-list {
                 display: flex;
                 flex-direction: column;
-                gap: 0.5rem;
+                gap: 1.25rem;
+                width: 100%;
             }
-            #chatWidget #inputWrapper > div:last-child {
-                display: flex !important;
-                flex-direction: row;
+            .cw-ms-footer {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                z-index: 10;
+                background: #fff;
+                border-radius: 0 0 1rem 1rem;
+            }
+            .cw-ms-composer {
+                border-top: 1px solid #e2e8f0;
+            }
+            .cw-ms-footer .cw-ms-textarea {
+                display: block;
+                width: 100%;
+                max-height: 9rem;
+                padding: 1rem 0.5rem 0.5rem 0.5rem;
+                border: none;
+                background: transparent;
+                outline: none;
+                resize: none;
+                font-size: 0.875rem;
+                line-height: 1.25rem;
+                color: #0f172a;
+                box-sizing: border-box;
+            }
+            .cw-ms-footer .cw-ms-textarea::placeholder {
+                color: #94a3b8;
+            }
+            .cw-ms-footer .cw-ms-toolbar {
+                display: flex;
                 align-items: center;
                 justify-content: space-between;
-                width: 100%;
-                gap: 0.5rem;
-                flex-wrap: nowrap;
+                gap: 0.25rem;
+                padding: 0 1rem 0.5rem 0;
             }
-            #chatWidget #inputWrapper > div:last-child > div {
-                display: flex !important;
-                flex-direction: row;
+            .cw-ms-footer .cw-ms-toolbar-group {
+                display: flex;
                 align-items: center;
-                gap: 0.5rem;
+                gap: 0.25rem;
             }
-            #chatWidget #cwComposerAttachBtn,
-            #chatWidget #cwComposerEmojiBtn {
-                color: #475569 !important;
-                opacity: 1 !important;
+            .cw-reply-compose {
+                padding: 0.5rem 0.5rem 0.375rem 0.625rem;
+                background: #fff;
             }
-            #chatWidget #cwComposerAttachBtn:hover,
-            #chatWidget #cwComposerEmojiBtn:hover {
-                background: rgba(148, 163, 184, 0.22);
-                border-radius: 0.5rem;
+            .cw-reply-compose-inner {
+                display: flex;
+                align-items: stretch;
+                gap: 0.625rem;
+                min-width: 0;
             }
-            #chatWidget #cwComposerAttachBtn svg path {
-                stroke: #475569 !important;
-                fill: none;
-                stroke-width: 1.5px;
-                stroke-linecap: round;
-                stroke-linejoin: round;
-            }
-            #chatWidget #cwComposerEmojiBtn svg path {
-                stroke: #475569 !important;
-                fill: none;
-                stroke-width: 1.5px;
-                stroke-linecap: round;
-            }
-            #chatWidget #cwComposerEmojiBtn svg > circle:first-of-type {
-                stroke: #475569 !important;
-                fill: none !important;
-                stroke-width: 1.5px;
-            }
-            #chatWidget .cw-mic-btn svg path {
-                stroke: #64748b;
-                fill: none;
-                stroke-width: 1.75px;
-                stroke-linecap: round;
-                stroke-linejoin: round;
-            }
-
-            .cw-mic-btn {
-                width: 2rem;
-                height: 2rem;
+            .cw-reply-compose-bar {
+                width: 3px;
+                flex-shrink: 0;
                 border-radius: 9999px;
+                background: var(--primary-color, #2563eb);
+            }
+            .cw-reply-compose-body {
+                flex: 1;
+                min-width: 0;
+            }
+            .cw-reply-compose-label {
+                display: block;
+                font-size: 0.6875rem;
+                font-weight: 600;
+                line-height: 1.2;
+                color: var(--primary-color, #2563eb);
+            }
+            .cw-reply-compose-preview {
+                display: block;
+                margin-top: 0.125rem;
+                font-size: 0.8125rem;
+                line-height: 1.3;
+                color: #64748b;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .cw-reply-compose-close {
+                flex-shrink: 0;
+                align-self: flex-start;
+                width: 1.75rem;
+                height: 1.75rem;
+                margin-top: -0.125rem;
+                margin-right: 0.125rem;
                 border: none;
-                background: #f1f5f9;
+                background: transparent;
+                color: #94a3b8;
+                border-radius: 0.5rem;
+                cursor: pointer;
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                cursor: default;
-                color: var(--cw-slate-600);
+                font-size: 1.125rem;
+                line-height: 1;
+                padding: 0;
+            }
+            .cw-reply-compose-close:hover {
+                background: #f1f5f9;
+                color: #475569;
+            }
+            #inputContainer:has(#cwReplyBar:not(.hidden)) .cw-ms-textarea {
+                padding-top: 0.375rem;
+            }
+            .cw-ms-icon-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 2rem;
+                height: 2rem;
+                border: none;
+                background: transparent;
+                border-radius: 9999px;
+                color: #64748b;
+                cursor: pointer;
+                flex-shrink: 0;
+                padding: 0;
+            }
+            .cw-ms-icon-btn:hover {
+                background: #f1f5f9;
+            }
+            .cw-ms-icon-btn svg {
+                width: 1rem;
+                height: 1rem;
                 flex-shrink: 0;
             }
-
-            .chat-widget-send-button.enabled {
-                background: var(--cw-navy) !important;
-                background-image: none !important;
+            .cw-ms-send-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 2rem;
+                height: 2rem;
+                border: 1px solid rgba(37, 99, 235, 0.2);
+                border-radius: 9999px;
+                background: var(--primary-color, #2563eb);
+                color: #fff;
+                cursor: not-allowed;
+                opacity: 0.5;
+                flex-shrink: 0;
+                padding: 0;
             }
-            .chat-widget-send-button.enabled:hover {
-                opacity: 0.92;
+            .cw-ms-send-btn.enabled {
+                opacity: 1;
+                cursor: pointer;
             }
-            #chatWidget #sendButton svg path {
-                stroke: #ffffff !important;
+            .cw-ms-send-btn.enabled:hover {
+                filter: brightness(0.95);
+            }
+            .cw-ms-send-btn svg path {
+                stroke: #fff !important;
                 fill: none;
+            }
+            .cw-msg-thread-wrap {
+                display: none;
             }
 
             #chatWidgetButton.cw-fab {
@@ -1384,6 +1478,17 @@
                 box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.35);
             }
 
+            .sr-only {
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                padding: 0;
+                margin: -1px;
+                overflow: hidden;
+                clip: rect(0, 0, 0, 0);
+                white-space: nowrap;
+                border: 0;
+            }
             .cw-msg-link {
                 color: #2563eb;
                 text-decoration: underline;
@@ -1393,6 +1498,7 @@
             .cw-link-card {
                 margin-top: 0.5rem;
                 display: flex;
+                flex-direction: row;
                 overflow: hidden;
                 border-radius: 0.75rem;
                 background: #fff;
@@ -1400,6 +1506,28 @@
                 text-align: left;
                 text-decoration: none;
                 color: inherit;
+            }
+            .cw-link-card--with-image {
+                flex-direction: column;
+            }
+            .cw-link-card--with-image .cw-link-card-accent {
+                display: none;
+            }
+            .cw-link-card-image-wrap {
+                width: 100%;
+                overflow: hidden;
+                line-height: 0;
+                background: #f1f5f9;
+                border-bottom: 1px solid var(--cw-slate-200);
+            }
+            .cw-link-card-image {
+                width: 100%;
+                max-height: 10rem;
+                object-fit: cover;
+                display: block;
+            }
+            .cw-link-card--loading .cw-link-card-sub {
+                opacity: 0.65;
             }
             .cw-link-card-accent {
                 width: 4px;
@@ -1427,29 +1555,58 @@
                 font-size: 0.6875rem;
                 color: var(--cw-slate-500);
                 margin-top: 0.25rem;
-                white-space: nowrap;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
                 overflow: hidden;
-                text-overflow: ellipsis;
+                word-break: break-word;
             }
 
             .cw-quote-block {
-                margin-bottom: 0.5rem;
-                padding: 0.5rem 0.65rem;
-                border-radius: 0.5rem;
-                background: #f1f5f9;
-                border: 1px solid rgba(226, 232, 240, 0.9);
-                border-left: 4px solid #64748b;
+                display: flex;
+                align-items: stretch;
+                gap: 0.5rem;
+                width: 100%;
+                max-width: 100%;
+                margin: 0 0 0.375rem;
+                padding: 0;
+                border: none;
+                border-radius: 0;
+                background: transparent;
             }
-            .cw-quote-author {
-                font-weight: 700;
-                font-size: 0.8125rem;
-                color: #2563eb;
+            .cw-quote-block--interactive {
+                cursor: pointer;
+                border-radius: 0.25rem;
+            }
+            .cw-quote-block--interactive:hover .cw-quote-text {
+                color: #475569;
+            }
+            .cw-quote-block-bar {
+                width: 3px;
+                flex-shrink: 0;
+                border-radius: 9999px;
+                background: #64748b;
             }
             .cw-quote-text {
+                flex: 1;
+                min-width: 0;
                 font-size: 0.8125rem;
-                color: #334155;
-                margin-top: 0.25rem;
-                line-height: 1.4;
+                line-height: 1.35;
+                color: #64748b;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+                word-break: break-word;
+            }
+
+            .cw-msg-interactive-stack {
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.5rem;
+                max-width: 100%;
+                min-width: 0;
             }
 
             .cw-out-name {
@@ -1527,18 +1684,19 @@
 
             .cw-date-pill {
                 position: sticky;
-                top: 8px;
+                top: 0;
                 z-index: 8;
-                align-self: center;
-                margin: 6px 0 10px 0;
-                padding: 2px 10px;
+                display: block;
+                width: fit-content;
+                max-width: 100%;
+                margin: 0 auto 0.75rem;
+                padding: 0.125rem 0.375rem;
                 border-radius: 9999px;
-                font-size: 11px;
-                font-weight: 600;
-                color: var(--cw-slate-500);
-                background: rgba(241, 245, 249, 0.95);
-                border: 1px solid rgba(226, 232, 240, 0.9);
-                backdrop-filter: blur(4px);
+                font-size: 0.75rem;
+                font-weight: 500;
+                color: #64748b;
+                background: #f8fafc;
+                border: none;
             }
 
             .cw-system-pill {
@@ -1561,92 +1719,137 @@
                 justify-content: center;
             }
 
+            .cw-message-menu-wrap {
+                flex-shrink: 0;
+                align-self: flex-end;
+                padding-bottom: 2px;
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.15s ease;
+            }
+            .cw-msg-bubble-group:hover .cw-message-menu-wrap,
+            .cw-msg-bubble-group:focus-within .cw-message-menu-wrap,
+            .cw-msg-bubble-group:has(.cw-message-menu:not(.hidden)) .cw-message-menu-wrap {
+                opacity: 1;
+                pointer-events: auto;
+            }
+            .cw-message-menu-dropdown {
+                position: relative;
+                display: inline-flex;
+            }
             .cw-message-menu-trigger {
-                width: 28px;
-                height: 28px;
+                width: 2rem;
+                height: 2rem;
                 border-radius: 9999px;
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
                 background: transparent;
-                border: 1px solid transparent;
+                border: none;
                 cursor: pointer;
-                opacity: 0;
-                pointer-events: none;
-                transition: opacity 140ms ease, background 140ms ease, border-color 140ms ease;
-            }
-            .cw-msg-wrap:hover .cw-message-menu-trigger,
-            .cw-msg-wrap:focus-within .cw-message-menu-trigger,
-            .cw-msg-wrap:has(.cw-message-menu:not(.hidden)) .cw-message-menu-trigger {
+                color: #64748b;
                 opacity: 1;
                 pointer-events: auto;
+                transition: background 0.15s ease, color 0.15s ease;
             }
-            .cw-message-menu-trigger:hover {
-                opacity: 1 !important;
-                background: rgba(0,0,0,0.04);
-                border-color: rgba(0,0,0,0.06);
+            .cw-message-menu-trigger-icon {
+                width: 1rem;
+                height: 1rem;
+                flex-shrink: 0;
+            }
+            .cw-message-menu-trigger:hover,
+            .cw-message-menu-trigger:focus-visible {
+                background: #f1f5f9;
+                color: #475569;
+                outline: none;
             }
             .cw-message-menu {
                 position: absolute;
-                bottom: calc(100% + 6px);
-                right: 0;
-                min-width: 140px;
+                bottom: calc(100% + 4px);
+                min-width: 8rem;
                 background: #fff;
-                border: 1px solid rgba(15, 23, 42, 0.10);
-                border-radius: 12px;
-                box-shadow: 0 18px 36px rgba(15, 23, 42, 0.12);
-                padding: 6px;
-                z-index: 20;
+                border: 1px solid #e2e8f0;
+                border-radius: 0.75rem;
+                box-shadow: 0 10px 15px -3px rgba(15, 23, 42, 0.08), 0 4px 6px -4px rgba(15, 23, 42, 0.06);
+                z-index: 30;
             }
             .cw-msg-row.cw-outbound .cw-message-menu {
                 right: auto;
                 left: 0;
             }
-            .cw-message-menu-left { right: 0; left: auto; }
-            .cw-message-menu-right { right: 0; left: auto; }
+            .cw-message-menu-left {
+                right: 0;
+                left: auto;
+            }
+            .cw-message-menu-right {
+                right: 0;
+                left: auto;
+            }
             .cw-message-menu.hidden { display: none; }
+            .cw-message-menu-inner {
+                padding: 0.25rem;
+            }
             .cw-message-menu-item {
                 width: 100%;
                 text-align: left;
-                padding: 7px 10px;
-                border-radius: 10px;
+                padding: 0.375rem 0.5rem;
+                border-radius: 0.5rem;
                 border: none;
                 background: transparent;
                 cursor: pointer;
-                font-size: 12px;
-                color: rgba(15, 23, 42, 0.88);
-                font-weight: 600;
+                font-size: 0.75rem;
+                line-height: 1.25rem;
+                color: #0f172a;
+                font-weight: 400;
                 display: flex;
                 align-items: center;
-                gap: 8px;
+                gap: 0.75rem;
             }
-            .cw-message-menu-item:hover {
-                background: rgba(0,0,0,0.045);
+            .cw-message-menu-item svg {
+                width: 0.875rem;
+                height: 0.875rem;
+                flex-shrink: 0;
+            }
+            .cw-message-menu-item:hover,
+            .cw-message-menu-item:focus-visible {
+                background: #f8fafc;
+                outline: none;
             }
             .cw-message-menu-item.cw-danger {
                 color: #b91c1c;
+            }
+            .cw-message-menu-item.cw-danger:hover {
+                background: #fef2f2;
             }
 
             .cw-msg-row {
                 display: flex;
                 width: 100%;
-                max-width: 100%;
-                gap: 10px;
+                max-width: 28rem;
+                gap: 0.5rem;
             }
-            .cw-msg-row.cw-inbound { justify-content: flex-start; align-items: flex-end; }
-            .cw-msg-row.cw-outbound { justify-content: flex-end; align-items: flex-end; }
+            .cw-msg-row.cw-inbound {
+                justify-content: flex-start;
+                align-items: flex-end;
+                margin-right: auto;
+            }
+            .cw-msg-row.cw-outbound {
+                justify-content: flex-end;
+                align-items: flex-end;
+                margin-left: auto;
+            }
 
             .cw-msg-avatar {
-                width: 28px;
-                height: 28px;
+                width: 2rem;
+                height: 2rem;
                 border-radius: 9999px;
                 flex-shrink: 0;
-                background: #e5e7eb;
+                background: #e2e8f0;
                 display: flex;
                 align-items: center;
                 justify-content: center;
                 overflow: hidden;
-                margin-top: 0;
+                margin-top: auto;
             }
             .cw-msg-avatar-img {
                 width: 100%;
@@ -1669,81 +1872,121 @@
 
             .cw-msg-col {
                 min-width: 0;
+                flex: 1;
                 display: flex;
                 flex-direction: column;
-                gap: 6px;
-                max-width: min(82%, 100%);
             }
-            .cw-msg-col.cw-outbound { align-items: flex-end; }
-            .cw-msg-meta {
+            .cw-msg-col.cw-outbound {
+                align-items: flex-end;
+                text-align: right;
+            }
+            .cw-msg-sender-name {
+                margin: 0 0 0.375rem;
+                padding-left: 0.625rem;
+                font-size: 0.75rem;
+                line-height: 1rem;
+                color: #64748b;
+                font-weight: 400;
+            }
+            .cw-msg-sender-name.cw-out {
+                padding-left: 0;
+                padding-right: 0.625rem;
+                text-align: right;
+            }
+            .cw-msg-stack {
                 display: flex;
-                align-items: center;
-                gap: 8px;
-                font-size: 11px;
-                color: var(--cw-slate-500);
+                flex-direction: column;
+                gap: 0.25rem;
+                width: 100%;
             }
-            .cw-msg-meta .cw-dot { opacity: 0.6; }
-            .cw-msg-meta .cw-name {
-                font-weight: 700;
-                color: var(--cw-slate-600);
+            .cw-msg-bubble-group {
+                display: flex;
+                align-items: flex-start;
+                gap: 0.5rem;
+                width: 100%;
+                word-break: break-word;
+            }
+            .cw-msg-bubble-group.cw-out-group {
+                justify-content: flex-end;
+            }
+            .cw-msg-bubble-group.cw-in-group {
+                justify-content: flex-start;
             }
 
             .cw-bubble-in {
-                background: #ffffff;
-                color: var(--cw-bubble-text);
-                border-radius: 1rem;
-                border-top-left-radius: 0.35rem;
-                padding: 0.65rem 0.85rem;
+                background: #f8fafc;
+                color: #0f172a;
+                border-radius: 0.75rem;
+                padding: 0.5rem 0.625rem 0.375rem;
                 font-size: 0.875rem;
                 line-height: 1.45;
                 word-break: break-word;
-                border: 1px solid rgba(226, 232, 240, 0.95);
+                border: none;
+                display: inline-block;
+                max-width: 100%;
+                text-align: left;
             }
             .cw-bubble-out {
-                background: var(--cw-navy);
-                color: #ffffff;
-                border-radius: 1rem;
-                border-top-right-radius: 0.35rem;
-                padding: 0.65rem 0.85rem;
+                background: #dbeafe;
+                color: #0f172a;
+                border-radius: 0.75rem;
+                padding: 0.5rem 0.625rem 0.375rem;
                 font-size: 0.875rem;
                 line-height: 1.45;
                 word-break: break-word;
-                border: 1px solid rgba(15, 23, 42, 0.4);
+                border: none;
+                display: inline-block;
+                max-width: 100%;
+                text-align: left;
+            }
+            .cw-bubble-text {
+                font-size: 0.875rem;
+                color: #0f172a;
+                line-height: 1.45;
+            }
+            .cw-bubble-meta {
+                display: inline;
+                white-space: nowrap;
+                margin-left: 0.35rem;
             }
             .cw-bubble-footer {
-                display: flex;
-                align-items: center;
-                justify-content: flex-end;
-                gap: 0.35rem;
-                margin-top: 0.45rem;
+                display: inline;
+                margin-top: 0;
                 font-size: 0.6875rem;
-                color: var(--cw-slate-500);
+                color: #64748b;
                 font-style: italic;
             }
-            .cw-bubble-out .cw-bubble-footer {
-                color: rgba(255, 255, 255, 0.72);
+            .cw-bubble-out .cw-bubble-footer,
+            .cw-bubble-out .cw-time {
+                color: #64748b;
             }
             .cw-bubble-out .cw-msg-link {
-                color: #93c5fd;
+                color: #2563eb;
             }
-            .cw-bubble-out .cw-quote-block {
-                background: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(255, 255, 255, 0.18);
-                border-left-color: #93c5fd;
-            }
-            .cw-bubble-out .cw-quote-author {
-                color: #93c5fd;
+            .cw-bubble-out .cw-quote-block-bar {
+                background: var(--primary-color, #2563eb);
             }
             .cw-bubble-out .cw-quote-text {
-                color: rgba(226, 232, 240, 0.95);
+                color: #475569;
+            }
+            .cw-bubble-in .cw-quote-block-bar {
+                background: #64748b;
+            }
+            .cw-bubble-in .cw-quote-text {
+                color: #64748b;
             }
             .cw-bubble-footer-in {
-                justify-content: flex-end;
-                flex-wrap: wrap;
-                gap: 0.35rem;
+                display: inline;
             }
             .cw-bubble-footer [data-outbound-ticks="1"] {
                 font-style: normal;
+                display: inline;
+                vertical-align: middle;
+            }
+            .cw-time {
+                font-size: 0.6875rem;
+                font-style: italic;
+                color: #64748b;
             }
 
             /* Quick replies: pills below bot bubble (Preline-style) */
@@ -1787,29 +2030,58 @@
                 background: #fff;
             }
 
-            /* Pre-chat form: hero + card body (reference layout) */
-            .cw-prechat-outer {
+            /* Pre-chat form — Preline welcome dropdown layout */
+            #messagesScreen #formContainer {
                 flex: 1 1 auto;
                 min-height: 0;
-                overflow-y: auto;
-                overflow-x: hidden;
-                padding: 8px 12px 12px;
-                -webkit-overflow-scrolling: touch;
-            }
-            .cw-prechat-card {
-                margin-left: auto;
-                margin-right: auto;
-                width: 100%;
-                max-width: 370px;
-                border-radius: 20px;
-                overflow: hidden;
+                display: none;
+                flex-direction: column;
                 background: #fff;
-                border: 1px solid rgba(148, 163, 184, 0.35);
-                box-shadow: 0 4px 24px rgba(15, 23, 42, 0.06);
+                overflow: hidden;
+            }
+            #messagesScreen #formContainer.cw-prechat-visible {
+                display: flex !important;
+                position: absolute;
+                inset: 0;
+                z-index: 20;
+            }
+            .cw-prechat-shell {
+                position: relative;
+                display: flex;
+                flex-direction: column;
+                flex: 1;
+                min-height: 0;
+                height: 100%;
+                background: #fff;
+            }
+            .cw-prechat-close-wrap {
+                position: absolute;
+                top: 0.5rem;
+                right: 1rem;
+                z-index: 12;
+            }
+            .cw-prechat-close {
+                width: 2rem;
+                height: 2rem;
+                border: none;
+                border-radius: 9999px;
+                background: transparent;
+                color: #64748b;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+            }
+            .cw-prechat-close:hover {
+                background: #f8fafc;
+                color: #0f172a;
             }
             .cw-prechat-hero {
-                position: relative;
+                flex-shrink: 0;
                 margin: 0;
+                overflow: hidden;
+                border-radius: 0.75rem 0.75rem 0 0;
             }
             .cw-prechat-hero figure {
                 margin: 0;
@@ -1821,138 +2093,245 @@
                 width: 100%;
                 height: auto;
             }
-            .cw-prechat-close {
-                position: absolute;
-                top: 10px;
-                right: 10px;
-                z-index: 2;
-                width: 32px;
-                height: 32px;
-                border: none;
-                border-radius: 9999px;
-                background: rgba(255, 255, 255, 0.9);
-                color: #64748b;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-            }
-            .cw-prechat-close:hover {
-                background: #fff;
-                color: #0f172a;
-            }
             .cw-prechat-logo-wrap {
-                position: absolute;
-                left: 20px;
-                bottom: -22px;
-                z-index: 2;
+                position: relative;
+                z-index: 10;
+                margin-top: -1.75rem;
+                margin-left: 0.625rem;
+                margin-bottom: 0;
+                width: 3.5rem;
+                height: 3.5rem;
+                flex-shrink: 0;
             }
             .cw-prechat-logo-circle {
-                width: 56px;
-                height: 56px;
+                width: 3.5rem;
+                height: 3.5rem;
                 border-radius: 9999px;
                 background: #fff;
-                border: 3px solid #fff;
-                box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
                 display: flex;
                 align-items: center;
                 justify-content: center;
+                box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+            }
+            .cw-prechat-logo-circle svg {
+                width: 1.75rem;
+                height: auto;
+            }
+            .cw-prechat-logo-circle svg path {
+                fill: var(--primary-color, #2563eb);
+            }
+            .cw-prechat-logo-img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                border-radius: 9999px;
             }
             .cw-prechat-body {
-                position: relative;
-                padding: 32px 20px 20px;
-                background: #fff;
+                flex: 1;
+                min-height: 0;
+                overflow-y: auto;
+                padding: 1.25rem;
+                -webkit-overflow-scrolling: touch;
             }
-            .cw-prechat-textarea-wrap textarea {
-                min-height: 112px;
-                padding-right: 56px;
-                padding-bottom: 40px;
-                resize: vertical;
+            .cw-prechat-intro-title {
+                margin: 0;
+                font-size: 1.25rem;
+                line-height: 1.75rem;
+                font-weight: 600;
+                color: #0f172a;
             }
-            .cw-prechat-textarea-actions {
-                position: absolute;
-                right: 10px;
-                bottom: 10px;
+            .cw-prechat-intro-sub {
+                margin: 0.25rem 0 0;
+                font-size: 0.875rem;
+                line-height: 1.25rem;
+                color: #64748b;
+            }
+            .cw-prechat-form {
+                margin-top: 1.25rem;
                 display: flex;
-                align-items: center;
-                gap: 2px;
+                flex-direction: column;
+                gap: 1.25rem;
             }
-            .cw-prechat-textarea-actions button {
-                width: 32px;
-                height: 32px;
+            .cw-prechat-field {
+                display: flex;
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+            .cw-prechat-label {
+                display: block;
+                margin: 0;
+                font-size: 0.875rem;
+                font-weight: 500;
+                color: #0f172a;
+            }
+            .cw-prechat-input {
+                display: block;
+                width: 100%;
+                box-sizing: border-box;
+                padding: 0.5rem 0.75rem;
+                border: 1px solid #e2e8f0;
+                border-radius: 0.5rem;
+                background: #fff;
+                font-size: 0.875rem;
+                line-height: 1.25rem;
+                color: #0f172a;
+                outline: none;
+                margin: 0;
+            }
+            .cw-prechat-input::placeholder {
+                color: #94a3b8;
+            }
+            .cw-prechat-input:focus {
+                border-color: var(--primary-color, #2563eb);
+                box-shadow: none;
+            }
+            .cw-prechat-message-box {
+                display: flex;
+                flex-direction: column;
+                padding-bottom: 0.25rem;
+                background: #fff;
+                border: 1px solid #e2e8f0;
+                border-radius: 0.5rem;
+            }
+            .cw-prechat-message-box:focus-within {
+                border-color: var(--primary-color, #2563eb);
+                box-shadow: none;
+            }
+            .cw-prechat-textarea {
+                display: block;
+                width: 100%;
+                box-sizing: border-box;
+                min-height: 4.5rem;
+                padding: 0.625rem 0.75rem;
                 border: none;
                 background: transparent;
+                resize: none;
+                font-size: 0.875rem;
+                line-height: 1.25rem;
+                color: #0f172a;
+                outline: none;
+                margin: 0;
+            }
+            .cw-prechat-textarea::placeholder {
                 color: #94a3b8;
-                cursor: pointer;
-                border-radius: 8px;
+            }
+            .cw-prechat-textarea-toolbar {
                 display: flex;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 0.25rem;
+                padding: 0.25rem 0.5rem;
+            }
+            .cw-prechat-textarea-toolbar button {
+                width: 1.5rem;
+                height: 1.5rem;
+                border: none;
+                background: transparent;
+                color: #64748b;
+                cursor: pointer;
+                border-radius: 9999px;
+                display: inline-flex;
                 align-items: center;
                 justify-content: center;
                 padding: 0;
-                opacity: 0.85;
             }
-            .cw-prechat-textarea-actions button:hover {
-                opacity: 1;
+            .cw-prechat-textarea-toolbar button:hover {
                 background: #f1f5f9;
-                color: #64748b;
+                color: #334155;
+            }
+            .cw-prechat-textarea-toolbar svg {
+                width: 0.875rem;
+                height: 0.875rem;
+            }
+            .cw-prechat-submit {
+                width: 100%;
+                padding: 0.625rem 0.75rem;
+                border: 1px solid rgba(37, 99, 235, 0.2);
+                border-radius: 0.5rem;
+                background: var(--primary-color, #2563eb);
+                color: #fff;
+                font-size: 0.875rem;
+                font-weight: 500;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 0.375rem;
+            }
+            .cw-prechat-submit:hover:not(:disabled) {
+                filter: brightness(0.95);
+            }
+            .cw-prechat-submit:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
             }
 
             .cw-bottom-nav {
-                border-top: 1px solid var(--cw-slate-200);
+                position: relative;
+                padding: 1rem 1.25rem;
                 background: #fff;
-                padding: 10px 10px 12px 10px;
-                display: flex;
-                align-items: stretch;
-                justify-content: stretch;
-                gap: 10px;
+                border-top: 1px solid #e2e8f0;
+                border-radius: 0 0 1rem 1rem;
             }
-            .cw-bottom-nav button {
+            .cw-bottom-nav__tabs {
+                display: flex;
+                width: 100%;
+                align-items: stretch;
+            }
+            .cw-bottom-nav .cw-nav-tab {
+                flex: 1 1 0;
+                min-width: 0;
                 border: none;
                 background: transparent;
                 cursor: pointer;
-                display: flex;
+                display: inline-flex;
                 flex-direction: column;
                 align-items: center;
                 justify-content: center;
-                gap: 4px;
-                flex: 1 1 0;
-                min-width: 0;
-                padding: 8px 10px;
-                border-radius: 14px;
-                color: rgba(30,30,30,0.55);
-                transition: background 140ms ease, color 140ms ease;
-            }
-            .cw-bottom-nav button.cw-nav-active {
-                background: #e8eef5;
+                gap: 1px;
+                padding: 0;
+                border-radius: 0.5rem;
+                font-size: 0.875rem;
+                line-height: 1.25rem;
                 color: #0f172a;
+                font-weight: 400;
+                transition: color 0.15s ease;
             }
-            .cw-bottom-nav button:not(.cw-nav-active) {
-                color: #94a3b8;
+            .cw-bottom-nav .cw-nav-tab:hover {
+                color: #1d4ed8;
             }
-            .cw-bottom-nav button.cw-nav-active .cw-nav-icon {
-                opacity: 1;
-                color: inherit;
+            .cw-bottom-nav .cw-nav-tab:focus {
+                outline: none;
             }
-            .cw-bottom-nav button:hover:not(.cw-nav-active) {
-                background: rgba(0,0,0,0.04);
-                color: #64748b;
+            .cw-bottom-nav .cw-nav-tab:focus-visible {
+                outline: 2px solid #2563eb;
+                outline-offset: 2px;
             }
-            .cw-bottom-nav button:hover.cw-nav-active {
-                background: #dfe8f2;
-                color: #0f172a;
+            .cw-bottom-nav .cw-nav-tab.cw-nav-active {
+                color: #2563eb;
+                font-weight: 500;
+            }
+            .cw-bottom-nav .cw-nav-icon-wrap {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0.5rem 1rem;
+                border-radius: 9999px;
+                transition: background 0.15s ease;
+            }
+            .cw-bottom-nav .cw-nav-tab.cw-nav-active .cw-nav-icon-wrap {
+                background: #eff6ff;
             }
             .cw-bottom-nav .cw-nav-label {
-                font-size: 12px;
-                font-weight: 700;
+                font-size: 0.875rem;
+                font-weight: inherit;
+                line-height: 1.25rem;
             }
             .cw-bottom-nav .cw-nav-icon {
-                width: 20px;
-                height: 20px;
-                opacity: 0.9;
-            }
-            .cw-bottom-nav button:not(.cw-nav-active) .cw-nav-icon {
-                opacity: 0.85;
+                width: 1rem;
+                height: 1rem;
+                flex-shrink: 0;
+                display: block;
             }
             /* Home: Preline-style welcome screen */
             .cw-home-hero {
@@ -2005,6 +2384,45 @@
             .cw-home-channel-row:focus-visible {
                 outline: 2px solid rgba(15, 23, 42, 0.35);
                 outline-offset: 2px;
+            }
+            .cw-home-social-row {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: center;
+                gap: 14px;
+            }
+            .cw-home-social-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 44px;
+                height: 44px;
+                padding: 0;
+                border: none;
+                background: transparent;
+                cursor: pointer;
+                border-radius: 9999px;
+                flex-shrink: 0;
+                transition: transform 0.15s ease, opacity 0.15s ease;
+            }
+            .cw-home-social-btn:hover {
+                transform: scale(1.06);
+                opacity: 0.92;
+            }
+            .cw-home-social-btn:focus-visible {
+                outline: 2px solid rgba(15, 23, 42, 0.35);
+                outline-offset: 2px;
+            }
+            .cw-home-social-btn svg {
+                display: block;
+                flex-shrink: 0;
+                width: 44px;
+                height: 44px;
+            }
+            .cw-home-social-btn--email svg {
+                width: 30px;
+                height: 22px;
             }
             /* Unread badge on floating launcher */
             #chatWidgetButton .chat-widget-unread-badge {
@@ -2374,16 +2792,8 @@
                     z-index: 2147483001 !important;
                 }
                 
-                .chat-widget-form-container,
-                .cw-prechat-outer {
-                    padding: 12px 5vw 16px;
+                .chat-widget-form-container {
                     max-width: 100vw;
-                    margin: 0 auto;
-                    border-radius: 0;
-                    box-shadow: none;
-                }
-                .cw-prechat-card {
-                    border-radius: 16px;
                 }
                 
                 body.chat-widget-open {
@@ -2449,13 +2859,13 @@
         container.innerHTML = `
             <div id="chatWidget" class="cw-preline w-[400px] h-[700px] flex flex-col overflow-hidden absolute animate-slide-up chat-widget-window bottom-20 right-0 hidden bg-white">
                 <div class="cw-msg-header hide-on-home" id="mainHeader">
-                    <div class="flex items-center justify-between gap-2 border-b border-slate-200 px-2 py-2 w-full">
-                        <button type="button" class="flex shrink-0 justify-center items-center size-8 text-slate-600 hover:bg-slate-100 rounded-full focus:outline-none" onclick="chatWidget.showScreen('home')" title="Back" aria-label="Back">
+                    <div class="cw-msg-header-inner">
+                        <button type="button" onclick="chatWidget.showScreen('home')" title="Back" aria-label="Back">
                             <svg class="shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
                         </button>
 
-                        <div class="w-full min-w-0">
-                            <div class="truncate flex items-center gap-x-2">
+                        <div class="cw-msg-header-center min-w-0">
+                            <div class="truncate flex items-center gap-x-2 w-full">
                                 <span id="cwHeaderAvatarWrap" class="relative shrink-0 cw-header-avatar-wrap hidden" aria-hidden="true">
                                     <span id="cwHeaderAvatarPlaceholder" class="cw-header-avatar-placeholder hidden" aria-hidden="true">
                                         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" stroke="#64748b" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7" r="4" stroke="#64748b" stroke-width="2"/></svg>
@@ -2464,14 +2874,14 @@
                                     <span id="cwHeaderPresenceDot" class="absolute bottom-0 right-0 block size-2 rounded-full ring-2 ring-white bg-green-500 cw-online-dot cw-away" aria-hidden="true"></span>
                                 </span>
 
-                                <span class="grow truncate">
+                                <span class="grow truncate min-w-0">
                                     <span id="widgetHeaderTitle" class="truncate block font-semibold text-sm leading-4 text-slate-900">Chat</span>
                                     <span id="widgetHeaderSubtitle" class="truncate block text-xs leading-4 text-blue-600">Online</span>
                                 </span>
                             </div>
                         </div>
 
-                        <button type="button" class="flex shrink-0 justify-center items-center size-8 text-slate-600 hover:bg-slate-100 rounded-full focus:outline-none" onclick="chatWidget.toggleChat()" title="Close" aria-label="Close">
+                        <button type="button" onclick="chatWidget.toggleChat()" title="Close" aria-label="Close">
                             <svg class="shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
                         </button>
                     </div>
@@ -2519,48 +2929,43 @@
                                 </p>
                             </div>
 
-                            <div class="my-3">
-                                <button type="button" class="cw-home-primary-btn w-full rounded-lg bg-slate-900 px-4 py-3 text-[14px] font-semibold text-white hover:bg-slate-800 focus:outline-none" onclick="chatWidget.showScreen('messages')" aria-label="Send us a message">
+                            <div class="my-3" id="widgetDirectMessageBtnWrap" style="display:none">
+                                <button type="button" id="widgetDirectMessageBtn" class="cw-home-primary-btn w-full rounded-lg bg-slate-900 px-4 py-3 text-[14px] font-semibold text-white hover:bg-slate-800 focus:outline-none" onclick="chatWidget.showScreen('messages')" aria-label="Send us a message">
                                     Send us a message
                                 </button>
                             </div>
 
-                            <!-- Dynamic channels (same logic as previous design; visibility controlled by settings) -->
-                            <div class="mb-3 grid grid-cols-4 gap-3" aria-label="Contact options">
-                                <button type="button" id="widgetDirectMessageRow" class="cw-home-channel-row rounded-xl bg-white p-3 text-left focus:outline-none flex items-center gap-3" onclick="chatWidget.showScreen('messages')" aria-label="Direct message">
-                                    <span class="flex h-11 w-11 items-center justify-center rounded-full flex-shrink-0" style="background:#4285F4" aria-hidden="true">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-6 h-6" aria-hidden="true">
-                                            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                            <!-- Social channels: heading + icon row -->
+                            <div class="mb-3" id="widgetSocialChannelsSection" style="display:none">
+                                <p class="mb-2 text-center text-[13px] font-medium text-slate-500" id="widgetSocialChannelsTitle">Connect with us</p>
+                                <div class="cw-home-social-row" id="widgetSocialChannelsGrid" aria-label="Contact options">
+                                    <button type="button" id="widgetWhatsAppRow" class="cw-home-social-btn" style="display:none" onclick="chatWidget.openWhatsApp()" aria-label="WhatsApp">
+                                        <svg viewBox="0 0 667 667" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" class="h-11 w-11 shrink-0">
+                                            <path d="M222.674 298.117L273.674 246.784L260.34 200.117H200.007C200.007 200.117 186.34 284.784 284.007 382.117C381.674 479.451 466.674 466.784 466.674 466.784V406.45L420.007 393.117L368.674 444.117" stroke="#94D4B3" stroke-width="66.6667" stroke-linecap="round" stroke-linejoin="round"></path>
+                                            <path d="M629.34 382.117C621.658 428.784 603.051 472.974 575.038 511.081C547.024 549.187 510.398 580.131 468.147 601.386C425.897 622.641 379.22 633.606 331.925 633.385C284.63 633.165 238.057 621.765 196.007 600.117L33.3403 633.45L66.6736 470.783C44.9189 428.578 33.4928 381.812 33.3349 334.331C33.177 286.849 44.2918 240.008 65.7654 197.659C87.2389 155.31 118.458 118.663 156.855 90.7315C195.253 62.7998 239.731 44.3811 286.635 36.9899C333.538 29.5988 381.526 33.4463 426.652 48.2162C471.778 62.986 512.754 88.2563 546.211 121.949C579.667 155.642 604.648 196.795 619.1 242.024C633.552 287.253 637.061 335.267 629.34 382.117Z" stroke="#41916D" stroke-width="66.6667" stroke-linecap="round" stroke-linejoin="round"></path>
                                         </svg>
-                                    </span>
-                                </button>
+                                    </button>
 
-                                <button type="button" id="widgetWhatsAppRow" class="cw-home-channel-row rounded-xl bg-white p-3 text-left focus:outline-none flex items-center gap-3" onclick="chatWidget.openWhatsApp()" aria-label="WhatsApp">
-                                    <span class="flex h-11 w-11 items-center justify-center rounded-full flex-shrink-0" style="background:#25D366" aria-hidden="true">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-6 h-6" aria-hidden="true">
-                                            <path d="M21 11.5a8.5 8.5 0 1 1-16.2 3.6L3 21l5.9-1.7A8.38 8.38 0 0 0 12 20a8.5 8.5 0 0 0 9-8.5z"/>
-                                            <path d="M8.5 8.5c.5 3 4 6.5 6.5 7l1.5-1.5 2 1-1 2.5c-4 .5-10-5.5-10.5-10.5L9.5 6l2 1-1.5 1.5z"/>
+                                    <button type="button" id="widgetTelegramRow" class="cw-home-social-btn" style="display:none" onclick="chatWidget.openTelegram()" aria-label="Telegram">
+                                        <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" class="h-11 w-11 shrink-0">
+                                            <circle cx="16" cy="16" r="14" fill="url(#telegram-ico-widget)"></circle>
+                                            <path d="M22.9866 10.2088C23.1112 9.40332 22.3454 8.76755 21.6292 9.082L7.36482 15.3448C6.85123 15.5703 6.8888 16.3483 7.42147 16.5179L10.3631 17.4547C10.9246 17.6335 11.5325 17.541 12.0228 17.2023L18.655 12.6203C18.855 12.4821 19.073 12.7665 18.9021 12.9426L14.1281 17.8646C13.665 18.3421 13.7569 19.1512 14.314 19.5005L19.659 22.8523C20.2585 23.2282 21.0297 22.8506 21.1418 22.1261L22.9866 10.2088Z" fill="white"></path>
+                                            <defs>
+                                                <linearGradient id="telegram-ico-widget" x1="16" y1="2" x2="16" y2="30" gradientUnits="userSpaceOnUse">
+                                                    <stop stop-color="#37BBFE"></stop>
+                                                    <stop offset="1" stop-color="#007DBB"></stop>
+                                                </linearGradient>
+                                            </defs>
                                         </svg>
-                                    </span>
-                                </button>
+                                    </button>
 
-                                <button type="button" id="widgetTelegramRow" class="cw-home-channel-row rounded-xl bg-white p-3 text-left focus:outline-none flex items-center gap-3" onclick="chatWidget.openTelegram()" aria-label="Telegram">
-                                    <span class="flex h-11 w-11 items-center justify-center rounded-full flex-shrink-0" style="background:#229ED9" aria-hidden="true">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-6 h-6" aria-hidden="true">
-                                            <path d="M21 3L3 11l7 2 2 7 9-17z"/>
-                                            <path d="M10 13l11-10"/>
+                                    <button type="button" id="widgetEmailRow" class="cw-home-social-btn cw-home-social-btn--email" style="display:none" onclick="chatWidget.openEmail()" aria-label="Email">
+                                        <svg viewBox="0 0 750 550" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" class="shrink-0">
+                                            <path d="M66 25L375 244.25L684 25C688.028 22.4155 692.714 21.0416 697.5 21.0416C702.286 21.0416 706.972 22.4155 711 25C693.464 9.72906 671.236 0.908476 648 0H102C79.0677 0.204435 56.8735 8.13096 39 22.5C43.2641 20.2754 48.0794 19.3281 52.8684 19.7715C57.6574 20.2149 62.2169 22.0303 66 25Z" fill="#95D5B2"></path>
+                                            <path d="M714 25C715.822 26.3247 717.425 27.9276 718.75 29.75C722.571 35.1288 724.111 41.8001 723.034 48.3096C721.957 54.819 718.35 60.6387 713 64.5L389.5 295.25C385.266 298.265 380.198 299.885 375 299.885C369.802 299.885 364.734 298.265 360.5 295.25L37 64.25C31.65 60.3887 28.0433 54.569 26.9662 48.0596C25.8891 41.5501 27.4289 34.8788 31.25 29.5C32.5945 27.7664 34.1964 26.2489 36 25C24.8155 34.4912 15.8098 46.2831 9.59708 59.5714C3.38439 72.8596 0.110932 87.3316 0 102V448C0 475.052 10.7464 500.996 29.8751 520.125C49.0038 539.254 74.9479 550 102 550H648C675.052 550 700.996 539.254 720.125 520.125C739.254 500.996 750 475.052 750 448V102C749.889 87.3316 746.616 72.8596 740.403 59.5714C734.19 46.2831 725.184 34.4912 714 25ZM319.5 345.25L66 526.25C61.7797 529.306 56.7102 530.966 51.5 531C47.5337 530.982 43.6288 530.02 40.1077 528.194C36.5866 526.368 33.5504 523.731 31.25 520.5C27.4289 515.121 25.8891 508.45 26.9662 501.94C28.0433 495.431 31.65 489.611 37 485.75L290.5 304.75C295.882 301.562 302.264 300.508 308.386 301.796C314.508 303.084 319.924 306.62 323.566 311.706C327.208 316.792 328.811 323.059 328.058 329.269C327.305 335.479 324.252 341.181 319.5 345.25ZM719.5 520.25C717.2 523.481 714.163 526.118 710.642 527.944C707.121 529.77 703.216 530.732 699.25 530.75C694.04 530.716 688.97 529.056 684.75 526L430.5 345.25C427.518 343.484 424.936 341.117 422.918 338.3C420.899 335.483 419.489 332.277 418.775 328.886C418.062 325.495 418.061 321.992 418.774 318.6C419.486 315.209 420.896 312.003 422.913 309.185C424.931 306.367 427.512 304 430.494 302.233C433.475 300.466 436.791 299.338 440.231 298.921C443.672 298.504 447.161 298.807 450.478 299.81C453.795 300.814 456.868 302.496 459.5 304.75L713 485.75C718.35 489.611 721.957 495.431 723.034 501.94C724.111 508.45 722.571 515.121 718.75 520.5L719.5 520.25Z" fill="#40916C"></path>
                                         </svg>
-                                    </span>
-                                </button>
-
-                                <button type="button" id="widgetEmailRow" class="cw-home-channel-row rounded-xl bg-white p-3 text-left focus:outline-none flex items-center gap-3" onclick="chatWidget.openEmail()" aria-label="Email">
-                                    <span class="flex h-11 w-11 items-center justify-center rounded-full flex-shrink-0" style="background:#F59E0B" aria-hidden="true">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-6 h-6" aria-hidden="true">
-                                            <path d="M4 4h16v16H4z"/>
-                                            <path d="M22 6l-10 7L2 6"/>
-                                        </svg>
-                                    </span>
-                                </button>
+                                    </button>
+                                </div>
                             </div>
 
                             <h5 class="mb-2 text-[12px] text-slate-500" id="cwHomeTopicsTitle">Popular topics</h5>
@@ -2609,72 +3014,80 @@
                             <p class="text-sm text-slate-500 m-0">Loading...</p>
                         </div>
                     </div>
-                    <div class="cw-prechat-outer chat-widget-form-container hidden" id="formContainer" style="display:none;">
-                        <div class="cw-prechat-card">
-                            <div class="cw-prechat-hero">
-                                <button type="button" class="cw-prechat-close" onclick="chatWidget.showScreen('home')" title="Back" aria-label="Close form">
-                                    <svg viewBox="0 0 24 24" fill="none" class="w-4 h-4 text-current" aria-hidden="true">
-                                        <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                                    </svg>
+                    <div class="chat-widget-form-container hidden" id="formContainer" style="display:none;">
+                        <div class="cw-prechat-shell">
+                            <div class="cw-prechat-close-wrap">
+                                <button type="button" class="cw-prechat-close" onclick="chatWidget.showScreen('home')" aria-label="Close">
+                                    <svg class="shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                                    <span class="sr-only">Close</span>
                                 </button>
-                                <figure aria-hidden="true">
-                                    <svg preserveAspectRatio="none" viewBox="0 0 576 140" xmlns="http://www.w3.org/2000/svg">
-                                        <g clip-path="url(#cwFormClip)">
-                                            <rect width="576" height="140" fill="#FF8F5D"/>
-                                            <rect x="-40" y="20" width="180" height="280" transform="rotate(-28 50 160)" fill="#B2E7FE"/>
-                                            <rect x="280" y="-60" width="120" height="320" transform="rotate(52 340 80)" fill="#4C48FF"/>
-                                            <rect x="120" y="40" width="200" height="120" transform="rotate(-12 220 100)" fill="#3ECEED"/>
+                            </div>
+
+                            <div class="cw-prechat-hero" aria-hidden="true">
+                                <figure>
+                                    <svg preserveAspectRatio="none" width="576" height="120" viewBox="0 0 576 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                        <g clip-path="url(#cwFormClip0)">
+                                            <rect width="576" height="120" fill="#B2E7FE"/>
+                                            <rect x="289.678" y="-90.3" width="102.634" height="391.586" transform="rotate(59.5798 289.678 -90.3)" fill="#FF8F5D"/>
+                                            <rect x="41.3926" y="-0.996094" width="102.634" height="209.864" transform="rotate(-31.6412 41.3926 -0.996094)" fill="#3ECEED"/>
+                                            <rect x="66.9512" y="40.4817" width="102.634" height="104.844" transform="rotate(-31.6412 66.9512 40.4817)" fill="#4C48FF"/>
                                         </g>
                                         <defs>
-                                            <clipPath id="cwFormClip">
-                                                <rect width="576" height="140" fill="#fff"/>
+                                            <clipPath id="cwFormClip0">
+                                                <rect width="576" height="120" fill="white"/>
                                             </clipPath>
                                         </defs>
                                     </svg>
                                 </figure>
-                                <div class="cw-prechat-logo-wrap" aria-hidden="true">
-                                    <div class="cw-prechat-logo-circle">
-                                        <svg class="w-7 h-7" viewBox="0 0 24 24" fill="none">
-                                            <path d="M12 3a7 7 0 0 0-7 7v9" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/>
-                                            <path d="M12 7a3 3 0 0 0-3 3v9" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/>
-                                            <circle cx="12" cy="12" r="2.5" fill="#0f172a"/>
+                            </div>
+
+                            <div class="cw-prechat-logo-wrap" aria-hidden="true">
+                                <div class="cw-prechat-logo-circle">
+                                    <img id="widgetFormLogo" class="cw-prechat-logo-img hidden" alt="" />
+                                    <span id="widgetFormLogoDefault" aria-hidden="true">
+                                        <svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                            <path fill-rule="evenodd" clip-rule="evenodd" d="M18.0835 3.23358C9.88316 3.23358 3.23548 9.8771 3.23548 18.0723V35.5832H0.583496V18.0723C0.583496 8.41337 8.41851 0.583252 18.0835 0.583252C27.7485 0.583252 35.5835 8.41337 35.5835 18.0723C35.5835 27.7312 27.7485 35.5614 18.0835 35.5614H16.7357V32.911H18.0835C26.2838 32.911 32.9315 26.2675 32.9315 18.0723C32.9315 9.8771 26.2838 3.23358 18.0835 3.23358Z" fill="currentColor"/>
+                                            <path fill-rule="evenodd" clip-rule="evenodd" d="M18.0833 8.62162C12.8852 8.62162 8.62666 12.9245 8.62666 18.2879V35.5833H5.97468V18.2879C5.97468 11.5105 11.3713 5.97129 18.0833 5.97129C24.7954 5.97129 30.192 11.5105 30.192 18.2879C30.192 25.0653 24.7954 30.6045 18.0833 30.6045H16.7355V27.9542H18.0833C23.2815 27.9542 27.54 23.6513 27.54 18.2879C27.54 12.9245 23.2815 8.62162 18.0833 8.62162Z" fill="currentColor"/>
+                                            <path d="M24.8225 18.1012C24.8225 21.8208 21.8053 24.8361 18.0833 24.8361C14.3614 24.8361 11.3442 21.8208 11.3442 18.1012C11.3442 14.3815 14.3614 11.3662 18.0833 11.3662C21.8053 11.3662 24.8225 14.3815 24.8225 18.1012Z" fill="currentColor"/>
                                         </svg>
-                                    </div>
+                                    </span>
                                 </div>
                             </div>
+
                             <div class="cw-prechat-body">
-                                <form id="contactForm" onsubmit="chatWidget.handleFormSubmit(event)" class="flex flex-col gap-0">
-                                    <div class="flex flex-col gap-1.5 mb-3">
-                                        <label class="text-[13px] font-semibold text-slate-800 ml-0.5" for="formName">Name</label>
-                                        <input type="text" id="formName" class="w-full px-3.5 py-3 border border-slate-200 rounded-xl text-[15px] text-slate-900 bg-white outline-none m-0 shadow-none transition-[border-color,box-shadow] duration-200 focus:border-slate-400 focus:ring-2 focus:ring-slate-200 placeholder:text-slate-400" placeholder="John Doe" required>
+                                <div>
+                                    <p class="cw-prechat-intro-title" id="cwFormTitle">Send a message</p>
+                                    <p class="cw-prechat-intro-sub" id="cwFormSubtitle">We'll get back to you in a few hours.</p>
+                                </div>
+
+                                <form id="contactForm" onsubmit="chatWidget.handleFormSubmit(event)" class="cw-prechat-form">
+                                    <div class="cw-prechat-field" id="formNameRow">
+                                        <label class="cw-prechat-label" for="formName">Name</label>
+                                        <input type="text" id="formName" class="cw-prechat-input" placeholder="John Doe">
                                     </div>
-                                    <div class="flex flex-col gap-1.5 mb-3">
-                                        <label class="text-[13px] font-semibold text-slate-800 ml-0.5" for="formEmail">Email</label>
-                                        <input type="email" id="formEmail" class="w-full px-3.5 py-3 border border-slate-200 rounded-xl text-[15px] text-slate-900 bg-white outline-none m-0 shadow-none transition-[border-color,box-shadow] duration-200 focus:border-slate-400 focus:ring-2 focus:ring-slate-200 placeholder:text-slate-400" placeholder="john@site.co" required>
+                                    <div class="cw-prechat-field" id="formEmailRow">
+                                        <label class="cw-prechat-label" for="formEmail">Email</label>
+                                        <input type="email" id="formEmail" class="cw-prechat-input" placeholder="john@site.co">
                                     </div>
-                                    <div class="flex flex-col gap-1.5 mb-3">
-                                        <label class="text-[13px] font-semibold text-slate-800 ml-0.5" for="formSubject">Subject</label>
-                                        <input type="text" id="formSubject" class="w-full px-3.5 py-3 border border-slate-200 rounded-xl text-[15px] text-slate-900 bg-white outline-none m-0 shadow-none transition-[border-color,box-shadow] duration-200 focus:border-slate-400 focus:ring-2 focus:ring-slate-200 placeholder:text-slate-400" placeholder="Preline Pro">
+                                    <div class="cw-prechat-field" id="formPhoneRow" style="display:none;">
+                                        <label class="cw-prechat-label" for="formPhone">Phone</label>
+                                        <input type="tel" id="formPhone" class="cw-prechat-input" placeholder="Your phone number">
                                     </div>
-                                    <div class="flex flex-col gap-1.5 mb-3" id="formPhoneRow" style="display:none;">
-                                        <label class="text-[13px] font-semibold text-slate-800 ml-0.5" for="formPhone">Phone</label>
-                                        <input type="tel" id="formPhone" class="w-full px-3.5 py-3 border border-slate-200 rounded-xl text-[15px] text-slate-900 bg-white outline-none m-0 shadow-none transition-[border-color,box-shadow] duration-200 focus:border-slate-400 focus:ring-2 focus:ring-slate-200 placeholder:text-slate-400" placeholder="Your phone number">
-                                    </div>
-                                    <div class="flex flex-col gap-1.5 mb-4">
-                                        <label class="text-[13px] font-semibold text-slate-800 ml-0.5" for="formMessage">How can we help?</label>
-                                        <div class="cw-prechat-textarea-wrap relative">
-                                            <textarea id="formMessage" class="w-full px-3.5 py-3 border border-slate-200 rounded-xl text-[15px] text-slate-900 bg-white outline-none m-0 shadow-none transition-[border-color,box-shadow] duration-200 focus:border-slate-400 focus:ring-2 focus:ring-slate-200 placeholder:text-slate-400" placeholder="Message..." rows="4" required></textarea>
-                                            <div class="cw-prechat-textarea-actions">
+                                    <div class="cw-prechat-field" id="formMessageRow">
+                                        <label class="cw-prechat-label" for="formMessage">How can we help?</label>
+                                        <div class="cw-prechat-message-box">
+                                            <textarea id="formMessage" class="cw-prechat-textarea" placeholder="Message..." rows="3" required></textarea>
+                                            <div class="cw-prechat-textarea-toolbar">
                                                 <button type="button" title="Attach file" aria-label="Attach file" onclick="chatWidget.showFileUploadPopup()">
-                                                    <svg viewBox="0 0 24 24" fill="none" class="w-[18px] h-[18px] stroke-currentColor stroke-[1.5]" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                                                 </button>
-                                                <button type="button" id="cwFormEmojiBtn" title="Emoji" aria-label="Emoji" onclick="chatWidget.toggleEmojiPicker()">
-                                                    <svg viewBox="0 0 24 24" fill="none" class="w-[18px] h-[18px] stroke-currentColor stroke-[1.5]" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke-width="1.5"/><circle cx="9" cy="9" r="1" fill="currentColor"/><circle cx="15" cy="9" r="1" fill="currentColor"/><path d="M8 14c1 1.5 3 2.5 4 2.5s3-1 4-2.5" stroke-width="1.5" stroke-linecap="round"/></svg>
+                                                <button type="button" id="cwFormEmojiBtn" title="Add emoji" aria-label="Add emoji" onclick="chatWidget.toggleEmojiPicker()">
+                                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/><path d="M16 5h6"/><path d="M19 2v6"/></svg>
                                                 </button>
                                             </div>
                                         </div>
                                     </div>
-                                    <button type="submit" class="w-full py-3.5 border-none rounded-xl text-[15px] font-semibold text-white bg-slate-900 cursor-pointer transition-[opacity,transform] duration-150 mt-1 shadow-sm hover:bg-slate-800 hover:opacity-95 disabled:opacity-50 disabled:cursor-not-allowed" id="formSubmitButton">Send us a message</button>
+                                    <button type="submit" class="cw-prechat-submit" id="formSubmitButton">Send us a message</button>
                                 </form>
                             </div>
                         </div>
@@ -2686,56 +3099,61 @@
                             <div class="text-[11px] leading-tight mt-0.5" id="assignedAgentStatus"></div>
                         </div>
                     </div>
-                    <div id="livechatTypingIndicator" class="hidden flex flex-wrap items-center px-3 py-2 text-[12px] text-slate-600 mx-3 mt-1 not-italic border-b border-transparent" style="display:none;" aria-live="polite"></div>
-                    <div class="cw-msg-thread-wrap">
-                    <div class="flex-1 overflow-y-auto min-h-0 flex-col chat-widget-messages cw-msg-thread px-0 py-0 flex flex-col gap-3 hidden" id="messagesContainer" style="display:none;">
+                    <div id="livechatTypingIndicator" class="hidden flex flex-wrap items-center px-4 py-2 text-[12px] text-slate-600 not-italic" style="display:none;" aria-live="polite"></div>
+                    <div class="cw-ms-scroll flex-1 min-h-0 overflow-y-auto">
+                        <div class="cw-ms-scroll-inner">
+                            <div class="cw-msg-list hidden" id="messagesContainer" style="display:none;"></div>
+                        </div>
                     </div>
-                    </div>
-                    <div class="cw-input-footer px-3 py-2 flex-shrink-0 hidden" id="inputContainer" style="display:none;position:relative">
-                        <div id="cwReplyBar" class="hidden mb-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-left">
-                            <div class="flex items-start justify-between gap-2">
-                                <div class="min-w-0 flex-1">
-                                    <div class="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Replying to</div>
-                                    <div class="mt-1 rounded-lg bg-slate-100 border border-slate-200 border-l-4 border-l-slate-500 px-2.5 py-2">
-                                        <div id="cwReplyBarPreview" class="text-[13px] text-slate-700 truncate"></div>
-                                    </div>
+                    <footer class="cw-ms-footer hidden" id="inputContainer" style="display:none;">
+                        <div id="cwReplyBar" class="cw-reply-compose hidden" style="display:none;" aria-live="polite">
+                            <div class="cw-reply-compose-inner">
+                                <div class="cw-reply-compose-bar" aria-hidden="true"></div>
+                                <div class="cw-reply-compose-body">
+                                    <span class="cw-reply-compose-label">Replying to</span>
+                                    <span id="cwReplyBarPreview" class="cw-reply-compose-preview"></span>
                                 </div>
-                                <button type="button" class="w-7 h-7 flex-shrink-0 flex items-center justify-center rounded-lg border-none bg-transparent text-slate-500 hover:bg-slate-100 cursor-pointer" onclick="chatWidget.clearPendingReply()" title="Cancel reply" aria-label="Cancel reply">×</button>
+                                <button type="button" class="cw-reply-compose-close" onclick="chatWidget.clearPendingReply()" title="Cancel reply" aria-label="Cancel reply">×</button>
                             </div>
                         </div>
-                        <div id="cwSelectionFooter" class="hidden mb-2 rounded-xl border border-slate-200 bg-white px-3 py-2.5">
-                            <div class="flex items-center justify-between gap-2 mb-2">
-                                <button type="button" class="text-xs font-semibold text-slate-600 px-2 py-1 rounded-lg hover:bg-slate-100 border-none bg-transparent cursor-pointer" onclick="chatWidget.clearMessageSelection()">Cancel</button>
-                                <div id="cwSelectionPreview" class="text-[11px] text-slate-500 truncate flex-1 text-right"></div>
-                            </div>
-                            <div class="flex flex-wrap gap-2 justify-center">
-                                <button type="button" class="text-xs font-semibold text-slate-800 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 cursor-pointer" onclick="chatWidget.footerActionReply()">Reply</button>
-                                <button type="button" id="cwFooterEditBtn" class="text-xs font-semibold text-slate-800 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 cursor-pointer hidden" onclick="chatWidget.footerActionEdit()">Edit</button>
+                        <div id="cwSelectionFooter" class="hidden px-3 pt-2" style="display:none;">
+                            <div class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+                                <div class="flex items-center justify-between gap-2 mb-2">
+                                    <button type="button" class="text-xs font-semibold text-slate-600 px-2 py-1 rounded-lg hover:bg-slate-100 border-none bg-transparent cursor-pointer" onclick="chatWidget.clearMessageSelection()">Cancel</button>
+                                    <div id="cwSelectionPreview" class="text-[11px] text-slate-500 truncate flex-1 text-right"></div>
+                                </div>
+                                <div class="flex flex-wrap gap-2 justify-center">
+                                    <button type="button" class="text-xs font-semibold text-slate-800 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 cursor-pointer" onclick="chatWidget.footerActionReply()">Reply</button>
+                                    <button type="button" id="cwFooterEditBtn" class="text-xs font-semibold text-slate-800 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 cursor-pointer hidden" onclick="chatWidget.footerActionEdit()">Edit</button>
+                                </div>
                             </div>
                         </div>
-                        <div class="flex flex-col bg-white border border-slate-200 rounded-xl px-3 py-2 gap-2 transition-colors duration-200 chat-widget-input-wrapper" id="inputWrapper">
-                                <textarea class="w-full border-none bg-transparent outline-none text-sm text-slate-800 px-1 py-1.5 resize-none min-h-[40px] placeholder:text-slate-400" placeholder="Message…" id="chatInput" rows="1" onkeypress="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatWidget.sendMsg()}" onfocus="document.getElementById('inputWrapper').classList.add('focused')" onblur="document.getElementById('inputWrapper').classList.remove('focused')"></textarea>
-                                <div class="flex items-center gap-2 justify-between w-full">
-                                <div class="flex items-center gap-2">
-                                    <button type="button" id="cwComposerAttachBtn" class="w-8 h-8 flex items-center justify-center cursor-pointer border-none bg-transparent p-0 opacity-60 transition-opacity duration-200 flex-shrink-0 hover:opacity-100 text-slate-600" title="Attach file" onclick="chatWidget.showFileUploadPopup()">
-                                        <svg viewBox="0 0 24 24" fill="none" class="w-4 h-4 stroke-currentColor stroke-[1.5] fill-none stroke-linecap-round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                        <div class="cw-ms-composer">
+                        <label for="chatInput" class="sr-only">Message</label>
+                        <div id="inputWrapper" class="pb-2 ps-2">
+                            <textarea class="cw-ms-textarea" placeholder="Message…" id="chatInput" rows="1" onkeypress="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatWidget.sendMsg()}"></textarea>
+                            <div class="cw-ms-toolbar">
+                                <div class="cw-ms-toolbar-group">
+                                    <button type="button" id="cwComposerAttachBtn" class="cw-ms-icon-btn" title="Attach file" onclick="chatWidget.showFileUploadPopup()" aria-label="Attach file">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                                     </button>
-                                    <button type="button" id="cwComposerEmojiBtn" class="w-8 h-8 flex items-center justify-center cursor-pointer border-none bg-transparent p-0 opacity-60 transition-opacity duration-200 flex-shrink-0 hover:opacity-100 text-slate-600" title="Emoji" onclick="chatWidget.toggleEmojiPicker()">
-                                        <svg viewBox="0 0 24 24" fill="none" class="w-4 h-4 stroke-currentColor stroke-[1.5]" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke-width="1.5"/><circle cx="9" cy="9" r="1" fill="currentColor"/><circle cx="15" cy="9" r="1" fill="currentColor"/><path d="M8 14c1 1.5 3 2.5 4 2.5s3-1 4-2.5" stroke-width="1.5" stroke-linecap="round"/></svg>
+                                    <button type="button" id="cwComposerEmojiBtn" class="cw-ms-icon-btn" title="Add emoji" onclick="chatWidget.toggleEmojiPicker()" aria-label="Add emoji">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/><path d="M16 5h6"/><path d="M19 2v6"/></svg>
                                     </button>
                                 </div>
-                                <div class="flex items-center gap-2">
-                                    <button type="button" class="cw-mic-btn" title="Voice message" aria-hidden="true" tabindex="-1">
-                                        <svg viewBox="0 0 24 24" fill="none" class="w-4 h-4 stroke-currentColor stroke-[1.75]" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 19v3M8 22h8"/></svg>
+                                <div class="cw-ms-toolbar-group">
+                                    <button type="button" class="cw-ms-icon-btn" title="Send voice message" aria-hidden="true" tabindex="-1">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
                                     </button>
-                                <button type="button" class="w-9 h-9 rounded-full bg-slate-900 border-none cursor-not-allowed flex items-center justify-center transition-all duration-200 flex-shrink-0 opacity-40 chat-widget-send-button enabled:opacity-100 enabled:cursor-pointer enabled:hover:opacity-90" id="sendButton" onclick="chatWidget.sendMsg()" title="Send" aria-label="Send">
-                                    <svg viewBox="0 0 24 24" class="w-4 h-4 stroke-white stroke-2 fill-none" aria-hidden="true"><path d="M12 19V5M12 5l-6 6M12 5l6 6"/></svg>
-                                </button>
+                                    <button type="button" class="cw-ms-send-btn" id="sendButton" onclick="chatWidget.sendMsg()" title="Send" aria-label="Send">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>
+                                    </button>
                                 </div>
                             </div>
+                        </div>
                         </div>
                         <div id="emojiPickerContainer" style="position:fixed;left:0;bottom:0;display:none;z-index:10002;pointer-events:auto"></div>
-                    </div>
+                    </footer>
                 </div>
                 <div class="chat-widget-screen cw-help-screen flex-1 min-h-0 flex-col" id="helpScreen">
                     <div class="cw-help-empty">
@@ -2754,27 +3172,36 @@
                     </div>
                 </div>
                 <div class="cw-bottom-nav" id="widgetBottomNav" aria-label="Chat navigation">
-                    <button type="button" data-cw-nav="home" class="cw-nav-active" onclick="chatWidget.showScreen('home')" aria-label="Home" aria-current="page">
-                        <svg class="cw-nav-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                            <path d="M3 10.5 12 3l9 7.5V21a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 21V10.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-                            <path d="M9 22v-7a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v7" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-                        </svg>
-                        <span class="cw-nav-label">Home</span>
-                    </button>
-                    <button type="button" data-cw-nav="messages" onclick="chatWidget.showScreen('messages')" aria-label="Messages">
-                        <svg class="cw-nav-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-                        </svg>
-                        <span class="cw-nav-label">Messages</span>
-                    </button>
-                    <button type="button" data-cw-nav="help" onclick="chatWidget.showScreen('help')" aria-label="Help">
-                        <svg class="cw-nav-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
-                            <path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.5V14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                            <circle cx="12" cy="17.5" r="1" fill="currentColor"/>
-                        </svg>
-                        <span class="cw-nav-label">Help</span>
-                    </button>
+                    <nav class="cw-bottom-nav__tabs" role="tablist" aria-orientation="horizontal">
+                        <button type="button" data-cw-nav="home" class="cw-nav-tab cw-nav-active" onclick="chatWidget.showScreen('home')" aria-label="Home" role="tab" aria-selected="true" aria-current="page">
+                            <span class="cw-nav-icon-wrap" aria-hidden="true">
+                                <svg class="cw-nav-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                                    <polyline points="9 22 9 12 15 12 15 22"/>
+                                </svg>
+                            </span>
+                            <span class="cw-nav-label">Home</span>
+                        </button>
+                        <button type="button" id="widgetBottomNavMessages" data-cw-nav="messages" class="cw-nav-tab" style="display:none" onclick="chatWidget.showScreen('messages')" aria-label="Messages" role="tab" aria-selected="false">
+                            <span class="cw-nav-icon-wrap" aria-hidden="true">
+                                <svg class="cw-nav-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4c0-1.1.9-2 2-2h8a2 2 0 0 1 2 2z"/>
+                                    <path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/>
+                                </svg>
+                            </span>
+                            <span class="cw-nav-label">Messages</span>
+                        </button>
+                        <button type="button" data-cw-nav="help" class="cw-nav-tab" onclick="chatWidget.showScreen('help')" aria-label="Help" role="tab" aria-selected="false">
+                            <span class="cw-nav-icon-wrap" aria-hidden="true">
+                                <svg class="cw-nav-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+                                    <path d="M12 17h.01"/>
+                                </svg>
+                            </span>
+                            <span class="cw-nav-label">Help</span>
+                        </button>
+                    </nav>
                 </div>
                 <!-- File Upload Popup (Inside Widget) -->
                 <div class="chat-widget-file-upload-popup hidden" id="fileUploadPopup">
@@ -2844,22 +3271,7 @@
         if (s === 'sending' || s === 'queued' || s === 'pending') {
             return '<span class="cw-status-sending" title="Sending" aria-label="Sending"></span>';
         }
-        if (s === 'failed') {
-            return '<span class="text-[10px] font-medium text-red-500">Failed</span>';
-        }
-        var seen = s === 'seen';
-        var dbl = seen || s === 'delivered' || s === 'sent';
-        var col = seen ? '#64748b' : 'rgba(100,116,139,0.75)';
-        var w = 13;
-        var h = 10;
-        var path = '<path d="M2 6l4 4 8-8" stroke="' + col + '" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>';
-        var single = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 16 12" aria-hidden="true" style="vertical-align:middle">' + path + '</svg>';
-        if (!dbl) {
-            return single;
-        }
-        var secondCol = seen ? '#64748b' : 'rgba(100,116,139,0.75)';
-        var path2 = '<path d="M2 6l4 4 8-8" stroke="' + secondCol + '" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>';
-        return '<span style="display:inline-flex;align-items:center;gap:0">' + single + '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 16 12" aria-hidden="true" style="margin-left:-7px;vertical-align:middle">' + path2 + '</svg></span>';
+        return '';
     }
 
     function resolveAgentLabelForMessage(message) {
@@ -2896,11 +3308,160 @@
 
     function extractFirstHttpUrl(text) {
         if (!text || typeof text !== 'string') return null;
-        var m = text.match(/https?:\/\/[^\s]+/i);
-        return m ? m[0] : null;
+        var m = text.match(/https?:\/\/[^\s<&]+[^.,)\]<\s]*/i);
+        if (!m) return null;
+        return m[0].replace(/[.,)\]>]+$/g, '');
     }
 
-    function buildLinkPreviewCardHtml(url) {
+    var linkPreviewCache = {};
+
+    function isLinkPreviewEnabled() {
+        var cfg = window.ChatWidgetConfig;
+        return !(cfg && cfg.disableLinkPreviews === true);
+    }
+
+    function isDirectImageUrl(url) {
+        if (!url) return false;
+        return /\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i.test(String(url));
+    }
+
+    function isStandaloneHttpUrl(text) {
+        if (!text || typeof text !== 'string') return false;
+        var trimmed = text.trim();
+        var first = extractFirstHttpUrl(trimmed);
+        return !!first && first === trimmed;
+    }
+
+    function isDownloadableAttachmentUrl(url) {
+        if (!url) return false;
+        var base = String(url).split('?')[0].split('#')[0].toLowerCase();
+        var exts = [
+            'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico',
+            'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv',
+            'zip', 'rar', '7z', 'tar', 'gz',
+            'mp3', 'mp4', 'm4a', 'wav', 'mov', 'avi', 'webm', 'mkv'
+        ];
+        for (var i = 0; i < exts.length; i++) {
+            if (base.endsWith('.' + exts[i])) return true;
+        }
+        return false;
+    }
+
+    function getLinkPreviewFetchUrl(targetUrl) {
+        var cfg = window.ChatWidgetConfig || {};
+        if (cfg.linkPreviewProxyUrl) {
+            var base = String(cfg.linkPreviewProxyUrl).trim();
+            if (base.indexOf('{{url}}') !== -1) {
+                return base.replace(/\{\{url\}\}/g, encodeURIComponent(targetUrl));
+            }
+            var sep = base.indexOf('?') >= 0 ? '&' : '?';
+            return base + sep + 'url=' + encodeURIComponent(targetUrl);
+        }
+        return 'https://api.microlink.io/?url=' + encodeURIComponent(targetUrl);
+    }
+
+    function fetchLinkPreviewMeta(url) {
+        if (!url) return Promise.resolve(null);
+        var cached = linkPreviewCache[url];
+        if (cached) {
+            return Promise.resolve(cached.failed ? null : cached);
+        }
+        return fetch(getLinkPreviewFetchUrl(url), { method: 'GET', credentials: 'omit' })
+            .then(function (res) {
+                if (!res || !res.ok) {
+                    linkPreviewCache[url] = { failed: true };
+                    return null;
+                }
+                return res.json();
+            })
+            .then(function (json) {
+                if (!json || json.status !== 'success' || !json.data) {
+                    linkPreviewCache[url] = { failed: true };
+                    return null;
+                }
+                var d = json.data;
+                var meta = {
+                    title: d.title ? String(d.title).trim() : '',
+                    description: d.description ? String(d.description).trim() : '',
+                    siteName: d.publisher ? String(d.publisher).trim() : '',
+                    image: d.image && d.image.url ? String(d.image.url) : ''
+                };
+                linkPreviewCache[url] = meta;
+                return meta;
+            })
+            .catch(function () {
+                linkPreviewCache[url] = { failed: true };
+                return null;
+            });
+    }
+
+    function applyLinkPreviewMetaToCard(cardEl, meta) {
+        if (!cardEl || !meta) return;
+        cardEl.classList.remove('cw-link-card--loading');
+        if (meta.image && !cardEl.querySelector('.cw-link-card-image')) {
+            cardEl.classList.add('cw-link-card--with-image');
+            var accent = cardEl.querySelector('.cw-link-card-accent');
+            if (accent) accent.style.display = 'none';
+            var wrap = document.createElement('span');
+            wrap.className = 'cw-link-card-image-wrap';
+            var img = document.createElement('img');
+            img.className = 'cw-link-card-image';
+            img.src = meta.image;
+            img.alt = '';
+            img.loading = 'lazy';
+            img.referrerPolicy = 'no-referrer';
+            wrap.appendChild(img);
+            cardEl.insertBefore(wrap, cardEl.firstChild);
+        }
+        var titleEl = cardEl.querySelector('.cw-link-card-title');
+        if (titleEl && meta.title) titleEl.textContent = meta.title;
+        var subEl = cardEl.querySelector('.cw-link-card-sub');
+        if (subEl) {
+            if (meta.siteName) subEl.textContent = meta.siteName;
+            else if (meta.image) subEl.textContent = 'Web page';
+        }
+        var descEl = cardEl.querySelector('.cw-link-card-desc');
+        if (descEl && meta.description) descEl.textContent = meta.description;
+    }
+
+    function hydrateLinkPreviewCard(cardEl, url) {
+        if (!cardEl || !url || cardEl.getAttribute('data-cw-link-preview-hydrated') === '1') return;
+        var cached = linkPreviewCache[url];
+        if (cached && cached.failed) {
+            cardEl.classList.remove('cw-link-card--loading');
+            cardEl.setAttribute('data-cw-link-preview-hydrated', '1');
+            return;
+        }
+        if (cached && !cached.failed) {
+            applyLinkPreviewMetaToCard(cardEl, cached);
+            cardEl.setAttribute('data-cw-link-preview-hydrated', '1');
+            return;
+        }
+        fetchLinkPreviewMeta(url).then(function (meta) {
+            if (!meta || !document.body.contains(cardEl)) {
+                if (cardEl && document.body.contains(cardEl)) {
+                    cardEl.classList.remove('cw-link-card--loading');
+                }
+                return;
+            }
+            applyLinkPreviewMetaToCard(cardEl, meta);
+            cardEl.setAttribute('data-cw-link-preview-hydrated', '1');
+        });
+    }
+
+    function hydrateAllLinkPreviewCards(root) {
+        if (!isLinkPreviewEnabled()) return;
+        var scope = root || document.getElementById('messagesContainer');
+        if (!scope) return;
+        var cards = scope.querySelectorAll('a.cw-link-card[data-cw-link-preview-url]');
+        for (var i = 0; i < cards.length; i++) {
+            var c = cards[i];
+            var u = c.getAttribute('data-cw-link-preview-url');
+            if (u) hydrateLinkPreviewCard(c, u);
+        }
+    }
+
+    function buildLinkPreviewCardHtml(url, meta) {
         if (!url) return '';
         var u;
         try {
@@ -2908,15 +3469,34 @@
         } catch (e) {
             return '';
         }
+        var hasMeta = meta && typeof meta === 'object' && !meta.failed;
         var host = escapeHtml(u.hostname || 'Link');
         var safeUrl = escapeHtml(url);
+        var title = hasMeta && meta.title ? escapeHtml(String(meta.title).trim()) : host;
+        var sub = hasMeta && meta.siteName
+            ? escapeHtml(String(meta.siteName).trim())
+            : (hasMeta && meta.image ? 'Image' : 'Web page');
+        var desc = hasMeta && meta.description
+            ? escapeHtml(String(meta.description).trim())
+            : safeUrl;
+        var cardClasses = 'cw-link-card';
+        if (hasMeta && meta.image) cardClasses += ' cw-link-card--with-image';
+        else if (!hasMeta) cardClasses += ' cw-link-card--loading';
+        var imageHtml = '';
+        if (hasMeta && meta.image) {
+            imageHtml =
+                '<span class="cw-link-card-image-wrap">' +
+                '<img class="cw-link-card-image" src="' + escapeHtml(meta.image) + '" alt="" loading="lazy" referrerpolicy="no-referrer">' +
+                '</span>';
+        }
         return (
-            '<a class="cw-link-card" href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' +
+            '<a class="' + cardClasses + '" href="' + safeUrl + '" data-cw-link-preview-url="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' +
+            imageHtml +
             '<span class="cw-link-card-accent" aria-hidden="true"></span>' +
             '<span class="cw-link-card-body">' +
-            '<span class="cw-link-card-title">' + host + '</span>' +
-            '<span class="cw-link-card-sub">Web page</span>' +
-            '<span class="cw-link-card-desc">' + safeUrl + '</span>' +
+            '<span class="cw-link-card-title">' + title + '</span>' +
+            '<span class="cw-link-card-sub">' + sub + '</span>' +
+            '<span class="cw-link-card-desc">' + desc + '</span>' +
             '</span></a>'
         );
     }
@@ -2935,11 +3515,45 @@
                     return inbound ? resolveAgentLabelForMessage(m) : getVisitorDisplayName();
                 })();
                 var txt = String(m.message || '').trim();
+                txt = txt.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
                 if (txt.length > 220) txt = txt.slice(0, 220) + '…';
                 return { author: author, text: txt };
             }
         }
         return { author: 'Message', text: 'Original message' };
+    }
+
+    function messageReplySnippet(msg, maxLen) {
+        var raw = msg && msg.message != null ? String(msg.message) : '';
+        raw = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!raw) raw = 'Message';
+        var max = maxLen != null ? maxLen : 72;
+        if (raw.length > max) raw = raw.slice(0, max) + '…';
+        return raw;
+    }
+
+    function syncReplyBarVisibility(show) {
+        var rb = document.getElementById('cwReplyBar');
+        if (!rb) return;
+        if (show) {
+            rb.classList.remove('hidden');
+            rb.style.display = '';
+        } else {
+            rb.classList.add('hidden');
+            rb.style.display = 'none';
+        }
+    }
+
+    function updateReplyBarPreview() {
+        var rbp = document.getElementById('cwReplyBarPreview');
+        if (!rbp) return;
+        var pendingId = widgetState.pendingInReplyOf;
+        if (pendingId == null || String(pendingId) === '') {
+            rbp.textContent = '';
+            return;
+        }
+        var msg = getMessageFromStateByWidgetId(String(pendingId));
+        rbp.textContent = messageReplySnippet(msg, 72);
     }
 
     function buildReplyQuoteHtml(message) {
@@ -2948,9 +3562,9 @@
         var q = resolveQuotedFromReply(message);
         if (!q) return '';
         return (
-            '<div class="cw-quote-block">' +
-            '<div class="cw-quote-author">' + escapeHtml(q.author) + '</div>' +
-            '<div class="cw-quote-text">' + escapeHtml(q.text).replace(/\n/g, '<br>') + '</div>' +
+            '<div class="cw-quote-block cw-quote-block--interactive" data-reply-to="' + escapeHtml(String(pid)) + '" role="button" tabindex="0" aria-label="View original message">' +
+            '<span class="cw-quote-block-bar" aria-hidden="true"></span>' +
+            '<span class="cw-quote-text">' + escapeHtml(q.text.replace(/\s+/g, ' ')) + '</span>' +
             '</div>'
         );
     }
@@ -2960,6 +3574,9 @@
             var openMenus = document.querySelectorAll('.cw-message-menu:not(.hidden)');
             for (var i = 0; i < openMenus.length; i++) {
                 openMenus[i].classList.add('hidden');
+                var dropdown = openMenus[i].parentElement;
+                var trigger = dropdown && dropdown.querySelector('[data-cw-menu-trigger="1"]');
+                if (trigger) trigger.setAttribute('aria-expanded', 'false');
             }
         } catch (e) {}
     }
@@ -3003,6 +3620,39 @@
         return d === 'inbound' || d === 'incoming';
     }
 
+    function updateReplyTargetHighlightUi() {
+        var mc = document.getElementById('messagesContainer');
+        if (!mc) return;
+        var hid = widgetState.highlightedReplyTargetId;
+        var rows = mc.querySelectorAll('.cw-msg-wrap');
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i];
+            var id = r.getAttribute('data-message-id');
+            if (hid && id === String(hid)) r.classList.add('cw-msg-reply-target');
+            else r.classList.remove('cw-msg-reply-target');
+        }
+    }
+
+    function highlightReplyTargetMessage(id) {
+        if (!id) return;
+        var s = String(id);
+        if (widgetState.highlightedReplyTargetId === s) {
+            widgetState.highlightedReplyTargetId = null;
+        } else {
+            widgetState.highlightedReplyTargetId = s;
+            widgetState.selectedMessageId = null;
+        }
+        updateMessageRowsSelectedClass();
+        updateReplyTargetHighlightUi();
+        if (!widgetState.highlightedReplyTargetId) return;
+        var mc = document.getElementById('messagesContainer');
+        if (!mc) return;
+        var row = mc.querySelector('.cw-msg-wrap[data-message-id="' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]');
+        if (row && row.scrollIntoView) {
+            row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    }
+
     function updateMessageRowsSelectedClass() {
         var mc = document.getElementById('messagesContainer');
         if (!mc) return;
@@ -3019,35 +3669,23 @@
     function updateMessageSelectionUi() {
         var iw = document.getElementById('inputWrapper');
         var sf = document.getElementById('cwSelectionFooter');
-        var rb = document.getElementById('cwReplyBar');
-        var sel = widgetState.selectedMessageId;
         var hasReply = widgetState.pendingInReplyOf != null && String(widgetState.pendingInReplyOf) !== '';
-        if (!iw || !sf) return;
-        if (sel) {
-            if (rb) rb.classList.add('hidden');
-            iw.classList.add('hidden');
-            sf.classList.remove('hidden');
-            var msg = getMessageFromStateByWidgetId(sel);
-            var pv = document.getElementById('cwSelectionPreview');
-            if (pv) {
-                var snippet = msg && msg.message ? String(msg.message) : '';
-                if (snippet.length > 72) snippet = snippet.slice(0, 72) + '…';
-                pv.textContent = snippet;
-            }
-            var inbound = msg && isInboundMessageObj(msg);
-            var editBtn = document.getElementById('cwFooterEditBtn');
-            var delBtn = document.getElementById('cwFooterDeleteBtn');
-            if (editBtn) editBtn.classList.toggle('hidden', !!inbound);
-            if (delBtn) delBtn.classList.toggle('hidden', !!inbound);
-        } else {
+        if (!iw) return;
+
+        iw.classList.remove('hidden');
+
+        if (sf) {
             sf.classList.add('hidden');
-            iw.classList.remove('hidden');
-            if (rb) rb.classList.toggle('hidden', !hasReply);
+            sf.style.display = 'none';
         }
+
+        syncReplyBarVisibility(hasReply);
+        if (hasReply) updateReplyBarPreview();
     }
 
     function selectMessageByWidgetId(id, toggle) {
         if (!id) return;
+        widgetState.highlightedReplyTargetId = null;
         if (toggle && widgetState.selectedMessageId === id) {
             widgetState.selectedMessageId = null;
         } else {
@@ -3056,26 +3694,19 @@
         closeAllMessageMenus();
         updateMessageSelectionUi();
         updateMessageRowsSelectedClass();
+        updateReplyTargetHighlightUi();
     }
 
     function applyReplyToMessage(msg) {
         if (!msg || msg.id == null) return;
         widgetState.pendingInReplyOf = String(msg.id);
-        var rb = document.getElementById('cwReplyBar');
-        var rbp = document.getElementById('cwReplyBarPreview');
-        var snippet = msg.message ? String(msg.message) : '';
-        if (snippet.length > 100) snippet = snippet.slice(0, 100) + '…';
-        if (rbp) {
-            var dd = msg.direction ? String(msg.direction).toLowerCase() : '';
-            var inbound = dd === 'inbound' || dd === 'incoming';
-            var author = (msg.from_name && String(msg.from_name).trim())
-                ? String(msg.from_name).trim()
-                : (inbound ? resolveAgentLabelForMessage(msg) : getVisitorDisplayName());
-            rbp.innerHTML =
-                '<div style="font-weight:700;color:#2563eb;font-size:13px;line-height:1.2;">' + escapeHtml(author) + '</div>' +
-                '<div style="margin-top:2px;font-size:13px;color:#334155;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(snippet) + '</div>';
-        }
-        if (rb) rb.classList.remove('hidden');
+        widgetState.selectedMessageId = null;
+        updateReplyBarPreview();
+        syncReplyBarVisibility(true);
+        updateMessageSelectionUi();
+        updateMessageRowsSelectedClass();
+        var inp = document.getElementById('chatInput');
+        if (inp) inp.focus();
     }
 
     function installMessagesContainerClickDelegation() {
@@ -3085,12 +3716,19 @@
         mc.addEventListener('click', function(ev) {
             if (!ev || !ev.target) return;
             var t = ev.target;
-            if (t.closest && t.closest('a[href], .cw-link-card, button, .cw-message-menu, .cw-message-menu-trigger, textarea, input')) {
+            var quote = t.closest && t.closest('.cw-quote-block[data-reply-to]');
+            if (quote) {
+                if (ev.preventDefault) ev.preventDefault();
+                if (ev.stopPropagation) ev.stopPropagation();
+                var targetId = quote.getAttribute('data-reply-to');
+                if (targetId) highlightReplyTargetMessage(targetId);
+                return;
+            }
+            if (t.closest && t.closest('a[href], .cw-link-card, button, .cw-message-menu, .cw-message-menu-trigger, textarea, input, .cw-quick-replies')) {
                 return;
             }
             var wrap = t.closest && t.closest('.cw-msg-wrap');
             if (!wrap) return;
-            if (wrap.classList.contains('cw-msg-interactive')) return;
             var mid = wrap.getAttribute('data-message-id');
             if (!mid || String(mid).indexOf('temp_') === 0) return;
             selectMessageByWidgetId(String(mid), true);
@@ -3141,9 +3779,17 @@
 
     function updateOutboundTicksInRow(row, status) {
         if (!row || !row.querySelector) return;
+        var s = (status || '').toLowerCase();
+        var sending = s === 'sending' || s === 'queued' || s === 'pending';
         var host = row.querySelector('[data-outbound-ticks="1"]');
         if (host) {
             host.innerHTML = buildOutboundTicksHtml(status);
+        }
+        if (!sending) {
+            var footer = row.querySelector('.cw-bubble-footer');
+            if (footer && footer.querySelector('.cw-status-sending') && !footer.querySelector('.cw-time')) {
+                footer.innerHTML = '';
+            }
         }
     }
 
@@ -3187,6 +3833,37 @@
         }
         return '<svg viewBox="0 0 24 24" class="cw-msg-avatar-svg" aria-hidden="true"><path d="M12 12c2.8 0 5-2.2 5-5s-2.2-5-5-5-5 2.2-5 5 2.2 5 5 5zm0 2c-4.4 0-8 2.4-8 5.3V22h16v-2.7c0-2.9-3.6-5.3-8-5.3z" fill="rgba(0,0,0,0.35)"/></svg>';
     }
+
+    function buildMessageMenuHtml(menuId, messageId, options) {
+        var mid = messageId != null ? String(messageId) : '';
+        var o = options || {};
+        var placementClass = o.placement === 'left' ? 'cw-message-menu-left' : 'cw-message-menu-right';
+        var orderClass = o.order != null ? (' order-' + String(o.order)) : '';
+        var items = '';
+
+        if (o.edit) {
+            items += '<button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction(\'edit\',\'' + mid + '\')">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>' +
+                'Edit</button>';
+        }
+        if (o.reply) {
+            items += '<button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction(\'reply\',\'' + mid + '\')">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="m10 7-3 3 3 3"/><path d="M17 13v-1a2 2 0 0 0-2-2H7"/></svg>' +
+                'Reply</button>';
+        }
+        if (o.delete) {
+            items += '<button type="button" class="cw-message-menu-item cw-danger" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction(\'delete\',\'' + mid + '\')">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>' +
+                'Delete</button>';
+        }
+
+        return '<div class="cw-msg-actions' + orderClass + '"><div class="cw-message-menu-wrap"><div class="cw-message-menu-dropdown">' +
+            '<button type="button" data-cw-menu-trigger="1" class="cw-message-menu-trigger" aria-haspopup="menu" aria-expanded="false" aria-label="Message actions" onclick="chatWidget.toggleMessageMenu(event, \'' + menuId + '\')">' +
+            '<svg class="cw-message-menu-trigger-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>' +
+            '</button>' +
+            '<div id="' + menuId + '" class="cw-message-menu ' + placementClass + ' hidden" role="menu" aria-label="Message actions">' +
+            '<div class="cw-message-menu-inner">' + items + '</div></div></div></div></div>';
+    }
     
     function renderMessage(message) {
         var dir0 = message && message.direction ? String(message.direction).toLowerCase() : '';
@@ -3218,8 +3895,11 @@
             messageDiv.setAttribute('data-message-id', String(message.id));
         }
         
-        // Check if message is a file URL or has attachments
-        const isFileUrl = message.message && (message.message.startsWith('http://') || message.message.startsWith('https://'));
+        // Standalone http(s) URLs: file extensions → attachment UI; web pages → link preview
+        const messageText = message.message ? String(message.message) : '';
+        const standaloneUrl = isStandaloneHttpUrl(messageText) ? extractFirstHttpUrl(messageText.trim()) : null;
+        const isStandaloneFileAttachment = !!(standaloneUrl && isDownloadableAttachmentUrl(standaloneUrl));
+        const isStandaloneWebUrl = !!(standaloneUrl && !isDownloadableAttachmentUrl(standaloneUrl));
         
         // Handle attachments - can be array or object
         let attachments = [];
@@ -3236,9 +3916,9 @@
             }
         }
         
-        // If message itself is a URL and no attachments, treat it as attachment
-        if (isFileUrl && attachments.length === 0) {
-            attachments = [message.message];
+        // If message is only a file URL and no attachments, treat it as attachment
+        if (isStandaloneFileAttachment && attachments.length === 0) {
+            attachments = [standaloneUrl];
         }
         
         let messageContent = '';
@@ -3327,13 +4007,15 @@
             // Render all attachments
             attachmentContent = attachments.map(url => renderAttachment(url)).join('');
             
-            // Add message text if it exists and is not a file URL
-            if (message.message && !isFileUrl) {
+            // Add message text if it exists and is not a standalone file URL
+            if (message.message && !isStandaloneFileAttachment) {
                 messageContent = formatMessageBodyForWidget(message.message);
             }
         } else {
             // No attachments, just message text
             if (interactive) {
+                messageContent = '';
+            } else if (isStandaloneWebUrl && isLinkPreviewEnabled()) {
                 messageContent = '';
             } else {
                 messageContent = formatMessageBodyForWidget(message.message || '');
@@ -3342,10 +4024,24 @@
 
         var replyQuoteHtml = buildReplyQuoteHtml(message);
         var linkCardHtml = '';
-        if (!interactive && message.message && !isFileUrl) {
+        if (!interactive && message.message && !isStandaloneFileAttachment && isLinkPreviewEnabled()) {
             var firstUrl = extractFirstHttpUrl(message.message);
             if (firstUrl) {
-                linkCardHtml = buildLinkPreviewCardHtml(firstUrl);
+                if (isDirectImageUrl(firstUrl)) {
+                    try {
+                        var imgHost = new URL(firstUrl).hostname;
+                        linkCardHtml = buildLinkPreviewCardHtml(firstUrl, {
+                            title: imgHost,
+                            siteName: 'Image',
+                            description: firstUrl,
+                            image: firstUrl
+                        });
+                    } catch (eImg) {
+                        linkCardHtml = buildLinkPreviewCardHtml(firstUrl);
+                    }
+                } else {
+                    linkCardHtml = buildLinkPreviewCardHtml(firstUrl);
+                }
             }
         }
             if (isInbound) {
@@ -3354,52 +4050,39 @@
             var agentLabel = resolveAgentLabelForMessage(message);
             var menuId = 'cw_menu_' + (message && message.id != null ? String(message.id) : ('tmp_' + Math.random().toString(16).slice(2)));
             var midStr = (message && message.id != null) ? String(message.id) : '';
-                var inboundFooterHtml = '<div class="cw-bubble-footer cw-bubble-footer-in">' +
-                    '<span class="cw-time" title="' + inboundTitle + '">' + escapeHtml(inboundClock) + '</span>' +
-                    '</div>';
+                var inboundFooterHtml = '<span class="cw-bubble-meta"><span class="cw-time cw-bubble-footer" title="' + inboundTitle + '">' + escapeHtml(inboundClock) + '</span></span>';
             var interactiveInbound = !!interactive;
             var hasStaticBubble = !!(replyQuoteHtml || attachmentContent || messageContent || linkCardHtml);
             var bubbleInner = '';
             if (interactiveInbound) {
-                bubbleInner = '<div class="cw-bubble-in cw-bubble-in--interactive" data-cw-interactive="1"></div><div class="cw-quick-replies" aria-label="Quick replies"></div>';
+                bubbleInner = '<div class="cw-msg-interactive-stack"><div class="cw-bubble-in cw-bubble-in--interactive order-1" data-cw-interactive="1"><div class="cw-bubble-text"></div></div><div class="cw-quick-replies" aria-label="Quick replies"></div></div>';
             } else if (hasStaticBubble) {
-                bubbleInner = '<div class="cw-bubble-in">' + replyQuoteHtml + attachmentContent + (messageContent || '') + linkCardHtml + inboundFooterHtml + '</div>';
+                bubbleInner = '<div class="cw-bubble-in order-1"><div class="cw-bubble-text">' + replyQuoteHtml + attachmentContent + (messageContent || '') + linkCardHtml + inboundFooterHtml + '</div></div>';
             }
-            var inboundActionsHtml = '';
-            if (!interactiveInbound) {
-                inboundActionsHtml = `
-                    <div class="cw-msg-actions">
-                        <div class="relative">
-                            <button type="button" data-cw-menu-trigger="1" class="cw-message-menu-trigger" aria-label="Message actions" onclick="chatWidget.toggleMessageMenu(event, '${menuId}')">
-                                <svg class="shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
-                            </button>
-                            <div id="${menuId}" class="cw-message-menu cw-message-menu-left hidden" role="menu" aria-label="Message actions">
-                                <button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction('reply','${midStr}')">
-                                    <svg class="shrink-0 size-3.5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="m10 7-3 3 3 3"/><path d="M17 13v-1a2 2 0 0 0-2-2H7"/></svg>
-                                    Reply
-                                </button>
-                            </div>
-                        </div>
-                    </div>`;
-            }
+            var inboundActionsHtml = buildMessageMenuHtml(menuId, midStr, { reply: true, placement: 'left', order: 2 });
             messageDiv.innerHTML = `
                 <div class="cw-msg-row cw-inbound">
-                    <div class="cw-msg-avatar" aria-hidden="true">${buildInboundAvatarHtml()}</div>
-                    <div class="cw-msg-col">
-                        <p class="mb-1.5 ps-2.5 text-xs text-slate-500 font-semibold">${escapeHtml(agentLabel)}</p>
-                        ${bubbleInner}
+                    <div class="cw-msg-avatar shrink-0 mt-auto" aria-hidden="true">${buildInboundAvatarHtml()}</div>
+                    <div class="cw-msg-col cw-inbound">
+                        <p class="cw-msg-sender-name">${escapeHtml(agentLabel)}</p>
+                        <div class="cw-msg-stack">
+                            <div class="cw-msg-bubble-group cw-in-group group">
+                                ${bubbleInner}
+                                ${inboundActionsHtml}
+                            </div>
+                        </div>
                     </div>
-                    ${inboundActionsHtml}
                 </div>
             `;
 
             if (interactiveInbound) {
                 messageDiv.classList.add('cw-msg-interactive');
                 const bubble = messageDiv.querySelector('.cw-bubble-in[data-cw-interactive="1"]');
+                const bubbleText = bubble ? bubble.querySelector('.cw-bubble-text') : null;
                 if (bubble) {
                     bubble.removeAttribute('data-cw-interactive');
-                    if (replyQuoteHtml) bubble.insertAdjacentHTML('beforeend', replyQuoteHtml);
-                    if (attachmentContent) bubble.insertAdjacentHTML('beforeend', attachmentContent);
+                    if (replyQuoteHtml && bubbleText) bubbleText.insertAdjacentHTML('beforeend', replyQuoteHtml);
+                    if (attachmentContent && bubbleText) bubbleText.insertAdjacentHTML('beforeend', attachmentContent);
                 }
                 const frag = document.createElement('div');
                 const segments = (interactive && interactive.segments) ? interactive.segments : [];
@@ -3426,8 +4109,8 @@
                     span.innerHTML = escapeHtml(seg.content).replace(/\n/g, '<br>');
                     frag.appendChild(span);
                 }
-                if (bubble) {
-                    bubble.appendChild(frag);
+                if (bubbleText) {
+                    bubbleText.appendChild(frag);
                 }
 
                 if (interactive.buttons && interactive.buttons.length) {
@@ -3460,7 +4143,7 @@
                         }
                     }
                 }
-                if (bubble) bubble.insertAdjacentHTML('beforeend', inboundFooterHtml);
+                if (bubbleText) bubbleText.insertAdjacentHTML('beforeend', inboundFooterHtml);
             }
         } else {
             var outStatus = message.status ? String(message.status).toLowerCase() : '';
@@ -3474,38 +4157,21 @@
             var midStrOut = (message && message.id != null) ? String(message.id) : '';
             var visName = escapeHtml(getVisitorDisplayName());
             var outBubbleInner = (replyQuoteHtml || messageContent || linkCardHtml || attachmentContent)
-                ? ('<div class="cw-bubble-out">' + (replyQuoteHtml || '') + attachmentContent + (messageContent || '') + linkCardHtml +
-                    '<div class="cw-bubble-footer">' +
-                    '<span class="cw-time" title="' + outTitle + '">' + escapeHtml(outClock) + '</span>' +
-                    '<span data-outbound-ticks="1">' + tickHtml + '</span></div></div>')
+                ? ('<div class="cw-bubble-out order-2"><div class="cw-bubble-text">' + (replyQuoteHtml || '') + attachmentContent + (messageContent || '') + linkCardHtml +
+                    '<span class="cw-bubble-meta"><span class="cw-time cw-bubble-footer" title="' + outTitle + '">' + escapeHtml(outClock) + '</span>' +
+                    '<span data-outbound-ticks="1">' + tickHtml + '</span></span></div></div>')
                 : '';
+            var outMenuHtml = buildMessageMenuHtml(outMenuId, midStrOut, { edit: true, reply: true, delete: true, placement: 'right', order: 1 });
             messageDiv.innerHTML = `
                 <div class="cw-msg-row cw-outbound">
-                    <div class="cw-msg-actions">
-                        <div class="relative">
-                            <button type="button" data-cw-menu-trigger="1" class="cw-message-menu-trigger" aria-label="Message actions" onclick="chatWidget.toggleMessageMenu(event, '${outMenuId}')">
-                                <svg class="shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
-                            </button>
-                            <div id="${outMenuId}" class="cw-message-menu cw-message-menu-right hidden" role="menu" aria-label="Message actions">
-                                <button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction('edit','${midStrOut}')">
-                                    <svg class="shrink-0 size-3.5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-                                    Edit
-                                </button>
-                                <button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction('reply','${midStrOut}')">
-                                    <svg class="shrink-0 size-3.5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="m10 7-3 3 3 3"/><path d="M17 13v-1a2 2 0 0 0-2-2H7"/></svg>
-                                    Reply
-                                </button>
+                    <div class="cw-msg-col cw-outbound">
+                        <p class="cw-msg-sender-name cw-out">${visName}</p>
+                        <div class="cw-msg-stack">
+                            <div class="cw-msg-bubble-group cw-out-group group">
+                                ${outMenuHtml}
+                                ${outBubbleInner}
                             </div>
                         </div>
-                    </div>
-                    <div class="cw-msg-col cw-outbound">
-                        <p class="mb-1.5 pe-2.5 text-xs text-slate-500 font-semibold text-right">${visName}</p>
-                        ${outBubbleInner}
-                    </div>
-                    <div class="cw-msg-avatar cw-out" aria-hidden="true">
-                        <svg viewBox="0 0 24 24" class="cw-msg-avatar-svg" aria-hidden="true">
-                            <path d="M12 12c2.8 0 5-2.2 5-5s-2.2-5-5-5-5 2.2-5 5 2.2 5 5 5zm0 2c-4.4 0-8 2.4-8 5.3V22h16v-2.7c0-2.9-3.6-5.3-8-5.3z" fill="rgba(0,0,0,0.35)"/>
-                        </svg>
                     </div>
                 </div>
             `;
@@ -3757,6 +4423,12 @@
             if (!widgetState.conversationNumber) return;
             var session = await initializeChatSession(false);
             if (!session || !session.token) return;
+            var draft = '';
+            if (typing) {
+                var inputEl = document.getElementById('chatInput');
+                draft = inputEl && typeof inputEl.value === 'string' ? inputEl.value : '';
+                if (draft.length > 500) draft = draft.slice(0, 500);
+            }
             await fetch(getVisitorTypingApiUrl(), {
                 method: 'POST',
                 headers: {
@@ -3764,7 +4436,11 @@
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 },
-                body: JSON.stringify({ typing: !!typing })
+                body: JSON.stringify({
+                    typing: !!typing,
+                    conversation_number: widgetState.conversationNumber,
+                    draft: typing ? draft : null
+                })
             }).catch(function() {});
         } catch (e) {}
     }
@@ -4152,19 +4828,33 @@
         var kb = document.getElementById('widgetKnowledgeBaseRow');
         if (kb) kb.style.display = settings.knowledgebase === false ? 'none' : '';
 
-        // Social options on home (no "Social" group row; show each enabled option directly).
+        // Social options on home (WhatsApp / Telegram / Email icons only).
+        // Direct message uses the full-width "Send us a message" button + bottom nav tab.
         var social = settings.social || null;
+        var dmOn = isDirectMessageEnabled(settings);
         var waOn = !!(social && social.whatsapp && social.whatsapp.enabled);
         var tgOn = !!(social && social.telegram && social.telegram.enabled);
         var emOn = !!(social && social.email && social.email.enabled);
-        var dmRow = document.getElementById('widgetDirectMessageRow');
+        var dmBtnWrap = document.getElementById('widgetDirectMessageBtnWrap');
         var waRow = document.getElementById('widgetWhatsAppRow');
         var tgRow = document.getElementById('widgetTelegramRow');
         var emRow = document.getElementById('widgetEmailRow');
-        if (dmRow) dmRow.style.removeProperty('display');
-        if (waRow) waRow.style.display = waOn ? '' : 'none';
-        if (tgRow) tgRow.style.display = tgOn ? '' : 'none';
-        if (emRow) emRow.style.display = emOn ? '' : 'none';
+        var socialSection = document.getElementById('widgetSocialChannelsSection');
+        var messagesNavBtn = document.getElementById('widgetBottomNavMessages');
+        if (dmBtnWrap) dmBtnWrap.style.display = dmOn ? '' : 'none';
+        if (messagesNavBtn) messagesNavBtn.style.display = dmOn ? '' : 'none';
+        if (waRow) waRow.style.display = waOn ? 'inline-flex' : 'none';
+        if (tgRow) tgRow.style.display = tgOn ? 'inline-flex' : 'none';
+        if (emRow) emRow.style.display = emOn ? 'inline-flex' : 'none';
+        var socialCount = (waOn ? 1 : 0) + (tgOn ? 1 : 0) + (emOn ? 1 : 0);
+        if (socialSection) socialSection.style.display = socialCount > 0 ? '' : 'none';
+        if (!dmOn && widgetState.currentScreen === 'messages') {
+            setTimeout(function () {
+                if (window.chatWidget && typeof window.chatWidget.showScreen === 'function') {
+                    window.chatWidget.showScreen('home');
+                }
+            }, 0);
+        }
 
         var badge = document.getElementById('widgetStatusBadge');
         if (badge) {
@@ -4185,6 +4875,28 @@
         }
         
         updateFormFieldsVisibility(settings);
+        widgetState.formRequired = isFormRequired(settings);
+
+        var formLogo = document.getElementById('widgetFormLogo');
+        var formLogoDefault = document.getElementById('widgetFormLogoDefault');
+        if (formLogo && formLogoDefault) {
+            if (settings.icon) {
+                formLogo.src = settings.icon;
+                formLogo.alt = '';
+                formLogo.classList.remove('hidden');
+                formLogoDefault.classList.add('hidden');
+            } else {
+                formLogo.classList.add('hidden');
+                formLogo.removeAttribute('src');
+                formLogoDefault.classList.remove('hidden');
+            }
+        }
+        var titles = settings.titles || null;
+        var formTitle = document.getElementById('cwFormTitle');
+        var formSubtitle = document.getElementById('cwFormSubtitle');
+        if (formTitle) formTitle.textContent = (titles && titles.heading) ? titles.heading : 'Send a message';
+        if (formSubtitle) formSubtitle.textContent = (titles && titles.sub_heading) ? titles.sub_heading : "We'll get back to you in a few hours.";
+
         widgetState.widgetSettings = settings;
         updateAssignedAgentBarUi();
     }
@@ -4202,50 +4914,11 @@
         } catch (e2) {}
     }
 
-    function computeActiveHomeEntries(settings) {
-        const social = settings && settings.social ? settings.social : null;
-        const waOn = !!(social && social.whatsapp && social.whatsapp.enabled);
-        const tgOn = !!(social && social.telegram && social.telegram.enabled);
-        const emOn = !!(social && social.email && social.email.enabled);
-        const kbOn = !!(settings && settings.knowledgebase);
-        return { waOn, tgOn, emOn, kbOn };
+    function isDirectMessageEnabled(settings) {
+        var social = settings && settings.social ? settings.social : null;
+        return !!(social && social.direct_message && social.direct_message.enabled);
     }
 
-    async function maybeAutoOpenSingleEntry(settings) {
-        if (!settings) return;
-        // Only auto-open from the home selection screen.
-        if (widgetState.currentScreen && widgetState.currentScreen !== 'home') return;
-
-        const a = computeActiveHomeEntries(settings);
-        const kbUrl = getKnowledgeBaseUrl();
-
-        const active = [];
-        if (a.waOn) active.push('whatsapp');
-        if (a.tgOn) active.push('telegram');
-        if (a.emOn) active.push('email');
-        // Only count KB as actionable if we have a URL to open.
-        if (a.kbOn && kbUrl) active.push('knowledgebase');
-
-        if (active.length !== 1) return;
-
-        const only = active[0];
-        if (only === 'whatsapp') {
-            await window.chatWidget.openWhatsApp();
-            return;
-        }
-        if (only === 'telegram') {
-            await window.chatWidget.openTelegram();
-            return;
-        }
-        if (only === 'email') {
-            await window.chatWidget.openEmail();
-            return;
-        }
-        if (only === 'knowledgebase' && kbUrl) {
-            openExternalAndClose(kbUrl);
-        }
-    }
-    
     function applyWidgetSettingsAndGate(settings) {
         if (!settings) return true;
         var container = document.getElementById('chatWidgetContainer');
@@ -4310,6 +4983,176 @@
         return preChatForm.email === true || preChatForm.phone === true || preChatForm.name === true;
     }
     
+    function isPrechatFormOpen() {
+        var form = document.getElementById('formContainer');
+        if (!form) return false;
+        return !form.classList.contains('hidden') && form.style.display !== 'none';
+    }
+
+    function syncPrechatFormChrome() {
+        var form = document.getElementById('formContainer');
+        var header = document.getElementById('mainHeader');
+        var scroll = document.querySelector('#messagesScreen .cw-ms-scroll');
+        if (!form) return;
+        var open = isPrechatFormOpen();
+        if (open && widgetState.currentScreen === 'messages') {
+            form.classList.add('cw-prechat-visible');
+            if (header) {
+                header.classList.add('hide-on-home');
+                header.style.display = 'none';
+            }
+            if (scroll) scroll.style.display = 'none';
+        } else {
+            form.classList.remove('cw-prechat-visible');
+            if (scroll) scroll.style.removeProperty('display');
+            if (header && widgetState.currentScreen === 'messages' && isViewingMessages()) {
+                header.classList.remove('hide-on-home');
+                header.style.display = 'flex';
+            }
+        }
+    }
+
+    var messagesEntryPrefetchPromise = null;
+
+    function hasConversationNumber() {
+        var cn = widgetState.conversationNumber;
+        return cn !== null && cn !== undefined && cn !== '';
+    }
+
+    function resolveMessagesEntryViewFromState() {
+        if (sessionStorage.getItem('chatWidgetFormSubmitted') === 'true') return 'conversation';
+        if (hasConversationNumber()) return 'conversation';
+        if (widgetState.formRequired === false) return 'conversation';
+        if (widgetState.messagesLoaded && widgetState.messages !== null) {
+            if (widgetState.formRequired === true) return 'form';
+        }
+        return null;
+    }
+
+    function applyMessagesPaneView(view) {
+        var formContainer = document.getElementById('formContainer');
+        var messagesContainer = document.getElementById('messagesContainer');
+        var input = document.getElementById('inputContainer');
+        var header = document.getElementById('mainHeader');
+        var loaderContainer = document.getElementById('loaderContainer');
+        var scroll = document.querySelector('#messagesScreen .cw-ms-scroll');
+
+        if (view === 'loading') {
+            if (loaderContainer) loaderContainer.style.display = 'flex';
+            if (formContainer) {
+                formContainer.classList.add('hidden');
+                formContainer.classList.remove('cw-prechat-visible');
+                formContainer.style.display = 'none';
+            }
+            if (messagesContainer) {
+                messagesContainer.style.display = 'none';
+                messagesContainer.classList.add('hidden');
+            }
+            if (input) {
+                input.style.display = 'none';
+                input.classList.add('hidden');
+            }
+            if (header) {
+                header.classList.add('hide-on-home');
+                header.style.display = 'none';
+            }
+            if (scroll) scroll.style.display = 'none';
+            return;
+        }
+
+        if (loaderContainer) loaderContainer.style.display = 'none';
+
+        if (view === 'form') {
+            if (formContainer) {
+                formContainer.classList.remove('hidden');
+                formContainer.classList.add('cw-prechat-visible');
+                formContainer.style.display = 'flex';
+                formContainer.style.visibility = 'visible';
+                formContainer.style.opacity = '1';
+            }
+            if (messagesContainer) {
+                messagesContainer.style.display = 'none';
+                messagesContainer.classList.add('hidden');
+            }
+            if (input) {
+                input.style.display = 'none';
+                input.classList.add('hidden');
+            }
+            if (header) {
+                header.classList.add('hide-on-home');
+                header.style.display = 'none';
+            }
+            if (scroll) scroll.style.display = 'none';
+            if (widgetState.widgetSettings) {
+                updateFormFieldsVisibility(widgetState.widgetSettings);
+            }
+            return;
+        }
+
+        if (formContainer) {
+            formContainer.classList.add('hidden');
+            formContainer.classList.remove('cw-prechat-visible');
+            formContainer.style.display = 'none';
+        }
+        if (messagesContainer) {
+            messagesContainer.style.display = '';
+            messagesContainer.classList.remove('hidden');
+        }
+        if (input) {
+            input.style.display = 'block';
+            input.classList.remove('hidden');
+        }
+        if (scroll) scroll.style.removeProperty('display');
+        if (header && widgetState.currentScreen === 'messages') {
+            header.classList.remove('hide-on-home');
+            header.style.display = 'flex';
+        }
+    }
+
+    function finalizeConversationPane(messages) {
+        var list = messages != null ? messages : (widgetState.messages || []);
+        displayMessages(list);
+        var lastInbound = getLatestInboundId(list);
+        if (lastInbound != null) {
+            setLastSeenMessageId(lastInbound);
+            void markSeenUpTo(lastInbound);
+        }
+        updateAssignedAgentBarUi();
+    }
+
+    async function ensureMessagesEntryState() {
+        var known = resolveMessagesEntryViewFromState();
+        if (known) return known;
+
+        try {
+            var messagesData = await fetchMessages();
+            widgetState.messages = messagesData.messages;
+            widgetState.conversationNumber = messagesData.conversation_number;
+            widgetState.messagesLoaded = true;
+
+            if (hasConversationNumber() || sessionStorage.getItem('chatWidgetFormSubmitted') === 'true') {
+                return 'conversation';
+            }
+
+            var settings = widgetState.widgetSettings || await fetchWidgetSettings();
+            if (settings) widgetState.widgetSettings = settings;
+            widgetState.formRequired = isFormRequired(settings);
+            return widgetState.formRequired ? 'form' : 'conversation';
+        } catch (e) {
+            cwError('ChatWidget: ensureMessagesEntryState', e);
+            return 'conversation';
+        }
+    }
+
+    function prefetchMessagesEntryState() {
+        if (messagesEntryPrefetchPromise) return messagesEntryPrefetchPromise;
+        messagesEntryPrefetchPromise = ensureMessagesEntryState().catch(function (e) {
+            messagesEntryPrefetchPromise = null;
+            throw e;
+        });
+        return messagesEntryPrefetchPromise;
+    }
+
     function updateFormFieldsVisibility(settings) {
         if (!settings) return;
         
@@ -4321,17 +5164,10 @@
         const phoneField = document.getElementById('formPhone');
         const messageField = document.getElementById('formMessage');
         
-        // Message field is always visible when form is shown
-        if (messageField) {
-            const messageContainer = messageField.closest('.flex.flex-col');
-            if (messageContainer) {
-                messageContainer.style.display = 'flex';
-            }
-        }
+        const messageRow = document.getElementById('formMessageRow');
         
-        // Show/hide name field
         if (nameField) {
-            const nameContainer = nameField.closest('.flex.flex-col');
+            const nameContainer = document.getElementById('formNameRow');
             if (nameContainer) {
                 if (preChatForm.name === true) {
                     nameContainer.style.display = 'flex';
@@ -4343,9 +5179,8 @@
             }
         }
         
-        // Show/hide email field
         if (emailField) {
-            const emailContainer = emailField.closest('.flex.flex-col');
+            const emailContainer = document.getElementById('formEmailRow');
             if (emailContainer) {
                 if (preChatForm.email === true) {
                     emailContainer.style.display = 'flex';
@@ -4357,9 +5192,8 @@
             }
         }
         
-        // Show/hide phone field
         if (phoneField) {
-            const phoneContainer = document.getElementById('formPhoneRow') || phoneField.closest('.flex.flex-col');
+            const phoneContainer = document.getElementById('formPhoneRow');
             if (phoneContainer) {
                 if (preChatForm.phone === true) {
                     phoneContainer.style.display = 'flex';
@@ -4369,6 +5203,11 @@
                     phoneField.required = false;
                 }
             }
+        }
+
+        if (messageField && messageRow) {
+            messageRow.style.display = 'flex';
+            messageField.required = true;
         }
     }
     
@@ -4592,8 +5431,9 @@
             for (var j = 0; j < newItems.length; j++) {
                 mc.appendChild(renderMessage(newItems[j]));
             }
+            hydrateAllLinkPreviewCards(mc);
             setTimeout(function() {
-                mc.scrollTop = mc.scrollHeight;
+                scrollMessagesToBottom();
             }, 50);
             return;
         }
@@ -4612,16 +5452,31 @@
             var btn = buttons[i];
             var isAct = btn.getAttribute('data-cw-nav') === t;
             btn.classList.toggle('cw-nav-active', isAct);
+            btn.setAttribute('aria-selected', isAct ? 'true' : 'false');
             if (isAct) btn.setAttribute('aria-current', 'page');
             else btn.removeAttribute('aria-current');
         }
     }
     
+    function getMessagesScrollContainer() {
+        var mc = document.getElementById('messagesContainer');
+        if (!mc) return null;
+        var scroll = mc.closest('.cw-ms-scroll');
+        return scroll || mc;
+    }
+
+    function scrollMessagesToBottom() {
+        var el = getMessagesScrollContainer();
+        if (el) el.scrollTop = el.scrollHeight;
+    }
+
     function displayMessages(messages) {
         updateAssignedAgentBarUi();
         widgetState.selectedMessageId = null;
+        widgetState.highlightedReplyTargetId = null;
         updateMessageSelectionUi();
         updateMessageRowsSelectedClass();
+        updateReplyTargetHighlightUi();
         const messagesContainer = document.getElementById('messagesContainer');
         if (!messagesContainer) return;
         
@@ -4677,11 +5532,9 @@
             messagesContainer.appendChild(messageElement);
         }
         
+        hydrateAllLinkPreviewCards(messagesContainer);
         syncChatInputPlaceholder();
-        // Scroll to bottom
-        setTimeout(() => {
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }, 100);
+        scrollMessagesToBottom();
     }
     
     /** Lazy-load emoji-picker-element (single ESM, includes data; no extra JSON fetch). */
@@ -4792,11 +5645,6 @@
                 void initializeChatSession(false).catch(function(err) {
                     cwError('ChatWidget: session init failed', err);
                 });
-
-                // If only one entry is enabled, auto-open it (skip home picker).
-                void fetchWidgetSettings().then(function(s) {
-                    return maybeAutoOpenSingleEntry(s);
-                }).catch(function() {});
             } else {
                 w.classList.add('hidden');
                 b.classList.remove('open');
@@ -4860,7 +5708,10 @@
             }
 
             clearUnreadCount();
-            const c = document.querySelector('.chat-widget-messages');
+            const c = document.getElementById('messagesContainer');
+            if (!c) {
+                return;
+            }
                 
                 // Disable input and button while sending
                 i.disabled = true;
@@ -4876,27 +5727,30 @@
                 d.setAttribute('data-message-id', messageId);
                 d.innerHTML = `
                     <div class="cw-msg-row cw-outbound">
-                        <div class="cw-msg-actions">
-                            <div class="relative">
-                                <button type="button" class="cw-message-menu-trigger" aria-hidden="true" tabindex="-1" disabled>
-                                    <svg viewBox="0 0 24 24" class="w-[18px] h-[18px]" aria-hidden="true"><circle cx="12" cy="5" r="1.6" fill="rgba(60,60,60,0.45)"/><circle cx="12" cy="12" r="1.6" fill="rgba(60,60,60,0.45)"/><circle cx="12" cy="19" r="1.6" fill="rgba(60,60,60,0.45)"/></svg>
-                                </button>
-                            </div>
-                        </div>
                         <div class="cw-msg-col cw-outbound">
-                            <div class="cw-out-name">${escapeHtml(getVisitorDisplayName())}</div>
-                            <div class="cw-bubble-out">${escapeHtml(messageText).replace(/\n/g, '<br>')}
-                                <div class="cw-bubble-footer">
-                                    <span id="timeContainer_${messageId}" title="Sending"><span class="cw-status-sending" aria-label="Sending"></span></span>
-                                    <span data-outbound-ticks="1"></span>
+                            <p class="cw-msg-sender-name cw-out">${escapeHtml(getVisitorDisplayName())}</p>
+                            <div class="cw-msg-stack">
+                                <div class="cw-msg-bubble-group cw-out-group group">
+                                    <div class="cw-msg-actions order-1">
+                                        <div class="relative">
+                                            <button type="button" class="cw-message-menu-trigger" aria-hidden="true" tabindex="-1" disabled>
+                                                <svg viewBox="0 0 24 24" class="w-[18px] h-[18px]" aria-hidden="true"><circle cx="12" cy="5" r="1.6" fill="rgba(60,60,60,0.45)"/><circle cx="12" cy="12" r="1.6" fill="rgba(60,60,60,0.45)"/><circle cx="12" cy="19" r="1.6" fill="rgba(60,60,60,0.45)"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div class="cw-bubble-out order-2">
+                                        <div class="cw-bubble-text">${escapeHtml(messageText).replace(/\n/g, '<br>')}
+                                            <span class="cw-bubble-meta">
+                                                <span id="timeContainer_${messageId}" class="cw-bubble-footer" title="Sending"><span class="cw-status-sending" aria-label="Sending"></span></span>
+                                            </span>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
-                        <div class="cw-msg-avatar cw-out" aria-hidden="true">
-                            <svg viewBox="0 0 24 24" class="cw-msg-avatar-svg" aria-hidden="true"><path d="M12 12c2.8 0 5-2.2 5-5s-2.2-5-5-5-5 2.2-5 5 2.2 5 5 5zm0 2c-4.4 0-8 2.4-8 5.3V22h16v-2.7c0-2.9-3.6-5.3-8-5.3z" fill="rgba(0,0,0,0.35)"/></svg>
-                        </div>
                     </div>
                 `;
+                try {
                 c.appendChild(d);
                 
                 // Clear input
@@ -4907,7 +5761,7 @@
                 this.toggleSendButton();
                 
                 // Scroll to bottom
-                c.scrollTop = c.scrollHeight;
+                scrollMessagesToBottom();
                 
                 // Send to API (never block the user; retry with backoff on throttling/network).
                 const timeContainer = document.getElementById(`timeContainer_${messageId}`);
@@ -4922,8 +5776,7 @@
                             widgetState.pendingInReplyOf = null;
                             var rbp2 = document.getElementById('cwReplyBarPreview');
                             if (rbp2) rbp2.textContent = '';
-                            var rb2 = document.getElementById('cwReplyBar');
-                            if (rb2) rb2.classList.add('hidden');
+                            syncReplyBarVisibility(false);
                             updateMessageSelectionUi();
                         }
                         if (response && response.token) {
@@ -4955,7 +5808,10 @@
                             displayMessages(widgetState.messages);
                         } else {
                             if (timeContainer) {
-                                timeContainer.innerHTML = '<span>Just now</span>';
+                                var sentClock = formatMessageClock(new Date().toISOString());
+                                timeContainer.className = 'cw-time cw-bubble-footer';
+                                timeContainer.title = '';
+                                timeContainer.innerHTML = escapeHtml(sentClock);
                             }
                             if (widgetState.messages) {
                                 widgetState.messages.push({
@@ -5000,6 +5856,9 @@
                 };
 
                 void trySend(0);
+                } catch (sendUiErr) {
+                    cwError('ChatWidget: sendMsg UI error', sendUiErr);
+                }
 
                 // Re-enable input and button immediately (sending continues in background if throttled).
                 i.disabled = false;
@@ -5025,10 +5884,13 @@
                 ensureMessageMenuCloseHandlerInstalled();
                 if (event && event.stopPropagation) event.stopPropagation();
                 if (event && event.preventDefault) event.preventDefault();
-                closeAllMessageMenus();
                 var el = document.getElementById(String(menuId || ''));
-                if (!el) return;
-                el.classList.toggle('hidden');
+                var wasOpen = el && !el.classList.contains('hidden');
+                closeAllMessageMenus();
+                if (!el || wasOpen) return;
+                el.classList.remove('hidden');
+                var trigger = el.parentElement && el.parentElement.querySelector('[data-cw-menu-trigger="1"]');
+                if (trigger) trigger.setAttribute('aria-expanded', 'true');
             } catch (e) {}
         },
 
@@ -5038,31 +5900,30 @@
 
         clearMessageSelection: function () {
             widgetState.selectedMessageId = null;
+            widgetState.highlightedReplyTargetId = null;
             widgetState.editingMessageNumber = null;
             updateMessageSelectionUi();
             updateMessageRowsSelectedClass();
+            updateReplyTargetHighlightUi();
         },
 
         clearPendingReply: function () {
             widgetState.pendingInReplyOf = null;
             var rbp = document.getElementById('cwReplyBarPreview');
-            if (rbp) rbp.innerHTML = '';
-            var rb = document.getElementById('cwReplyBar');
-            if (rb) rb.classList.add('hidden');
+            if (rbp) rbp.textContent = '';
+            syncReplyBarVisibility(false);
             updateMessageSelectionUi();
         },
 
         footerActionReply: function () {
             var sel = widgetState.selectedMessageId;
-            if (!sel) return;
-            var msg = getMessageFromStateByWidgetId(sel);
+            var msg = sel ? getMessageFromStateByWidgetId(sel) : null;
+            if (!msg && widgetState.pendingInReplyOf) {
+                msg = getMessageFromStateByWidgetId(widgetState.pendingInReplyOf);
+            }
+            if (!msg) return;
             applyReplyToMessage(msg);
-            widgetState.selectedMessageId = null;
             closeAllMessageMenus();
-            updateMessageSelectionUi();
-            updateMessageRowsSelectedClass();
-            var inp = document.getElementById('chatInput');
-            if (inp) inp.focus();
         },
 
         footerActionEdit: function () {
@@ -5082,9 +5943,8 @@
             widgetState.selectedMessageId = null;
             widgetState.pendingInReplyOf = null;
             var rbp = document.getElementById('cwReplyBarPreview');
-            if (rbp) rbp.innerHTML = '';
-            var rb = document.getElementById('cwReplyBar');
-            if (rb) rb.classList.add('hidden');
+            if (rbp) rbp.textContent = '';
+            syncReplyBarVisibility(false);
             updateMessageSelectionUi();
             updateMessageRowsSelectedClass();
             if (inp) inp.focus();
@@ -5121,8 +5981,8 @@
             if (!type || idStr == null || idStr === '') return;
             var s = String(idStr);
             if (type === 'reply') {
-                widgetState.selectedMessageId = s;
-                this.footerActionReply();
+                var replyMsg = getMessageFromStateByWidgetId(s);
+                if (replyMsg) applyReplyToMessage(replyMsg);
                 return;
             }
             if (type === 'edit') {
@@ -5137,6 +5997,9 @@
         },
         
         showScreen: async function(screen) {
+            if (screen === 'messages' && !isDirectMessageEnabled(widgetState.widgetSettings)) {
+                screen = 'home';
+            }
             const home = document.getElementById('homeScreen');
             const messages = document.getElementById('messagesScreen');
             const help = document.getElementById('helpScreen');
@@ -5189,202 +6052,40 @@
                 } else if (screen === 'messages') {
                     messages.classList.add('active');
                     installMessagesContainerClickDelegation();
-                    // Visitor is now viewing the conversation; clear unread counter.
                     clearUnreadCount();
-                    // Hide the bottom nav in conversation view (matches new design)
                     if (bottomNav) bottomNav.style.display = 'none';
-                    // Show header only on messages screen
-                    header.classList.remove('hide-on-home');
-                    header.style.display = 'flex';
-                    
-                    // Check if we already have messages loaded (cached state)
-                    if (widgetState.messagesLoaded && widgetState.messages !== null) {
-                        // Use cached state - no need to fetch again
-                        const hasConversationNumber = widgetState.conversationNumber !== null && 
-                                                      widgetState.conversationNumber !== undefined && 
-                                                      widgetState.conversationNumber !== '';
-                        
-                        // Hide loader
-                        if (loaderContainer) {
-                            loaderContainer.style.display = 'none';
+                    widgetState.currentScreen = 'messages';
+
+                    var knownView = resolveMessagesEntryViewFromState();
+                    if (knownView) {
+                        applyMessagesPaneView(knownView);
+                        if (knownView === 'conversation') {
+                            finalizeConversationPane(widgetState.messages);
                         }
-                        
-                        if (hasConversationNumber || sessionStorage.getItem('chatWidgetFormSubmitted') === 'true') {
-                            // Show messages from cache
-                            formContainer.classList.add('hidden');
-                            formContainer.style.display = 'none';
-                            messagesContainer.style.display = 'flex';
-                            messagesContainer.classList.remove('hidden');
-                            input.style.display = 'block';
-                            input.classList.remove('hidden');
-                            displayMessages(widgetState.messages);
-                            var lastInboundCached = getLatestInboundId(widgetState.messages);
-                            if (lastInboundCached != null) {
-                                setLastSeenMessageId(lastInboundCached);
-                                void markSeenUpTo(lastInboundCached);
-                            }
-                        } else if (widgetState.formRequired) {
-                            // Show form from cache
-                            formContainer.classList.remove('hidden');
-                            formContainer.style.display = 'block';
-                            formContainer.style.visibility = 'visible';
-                            formContainer.style.opacity = '1';
-                            
-                            messagesContainer.style.display = 'none';
-                            messagesContainer.classList.add('hidden');
-                            input.style.display = 'none';
-                            input.classList.add('hidden');
-                            
-                            if (widgetState.widgetSettings) {
-                                updateFormFieldsVisibility(widgetState.widgetSettings);
-                            }
-                        } else {
-                            // Show messages (empty)
-                            formContainer.classList.add('hidden');
-                            formContainer.style.display = 'none';
-                            messagesContainer.style.display = 'flex';
-                            messagesContainer.classList.remove('hidden');
-                            input.style.display = 'block';
-                            input.classList.remove('hidden');
-                            displayMessages(widgetState.messages || []);
-                        }
-                        
-                        widgetState.currentScreen = 'messages';
-                        // Keep messages fresh while the widget is open.
                         startMessagePolling(5000);
                         updateBottomNavActive('messages');
-                        return; // Exit early, no need to fetch
-                    }
-                    
-                    // First time loading - show loader and fetch data
-                    if (loaderContainer) {
-                        loaderContainer.style.display = 'flex';
-                    }
-                    formContainer.classList.add('hidden');
-                    formContainer.style.display = 'none';
-                    messagesContainer.style.display = 'none';
-                    messagesContainer.classList.add('hidden');
-                    input.style.display = 'none';
-                    input.classList.add('hidden');
-                    
-                    // Check if form was already submitted in this session
-                    const formSubmitted = sessionStorage.getItem('chatWidgetFormSubmitted') === 'true';
-                    
-                    try {
-                        if (formSubmitted) {
-                            // Form already submitted, skip form and show messages
-                            const messagesData = await fetchMessages();
-                            
-                            // Cache the state
-                            widgetState.messages = messagesData.messages;
-                            widgetState.conversationNumber = messagesData.conversation_number;
-                            widgetState.messagesLoaded = true;
-                            
-                            // Hide loader
-                            if (loaderContainer) {
-                                loaderContainer.style.display = 'none';
-                            }
-                            
-                            formContainer.classList.add('hidden');
-                            formContainer.style.display = 'none';
-                            messagesContainer.style.display = 'flex';
-                            messagesContainer.classList.remove('hidden');
-                            input.style.display = 'block';
-                            input.classList.remove('hidden');
-                            displayMessages(messagesData.messages);
-                            var lastInboundFetched = getLatestInboundId(messagesData.messages);
-                            if (lastInboundFetched != null) {
-                                setLastSeenMessageId(lastInboundFetched);
-                                void markSeenUpTo(lastInboundFetched);
-                            }
-                        } else {
-                            // First check messages to see if conversation exists
-                            const messagesData = await fetchMessages();
-                            const hasConversationNumber = messagesData.conversation_number !== null && 
-                                                          messagesData.conversation_number !== undefined && 
-                                                          messagesData.conversation_number !== '';
-                            
-                            // Cache messages data
-                            widgetState.messages = messagesData.messages;
-                            widgetState.conversationNumber = messagesData.conversation_number;
-                            
-                            // Hide loader
-                            if (loaderContainer) {
-                                loaderContainer.style.display = 'none';
-                            }
-                            
-                            if (!hasConversationNumber) {
-                                // No conversation exists, check widget settings for pre_chat_form
-                                const settings = await fetchWidgetSettings();
-                                const formRequired = isFormRequired(settings);
-                                
-                                // Cache widget settings and form state
-                                widgetState.widgetSettings = settings;
-                                widgetState.formRequired = formRequired;
-                                widgetState.messagesLoaded = true;
-                                
-                                if (formRequired) {
-                                    // Show form with fields based on pre_chat_form settings
-                                    formContainer.classList.remove('hidden');
-                                    formContainer.style.display = 'block';
-                                    formContainer.style.visibility = 'visible';
-                                    formContainer.style.opacity = '1';
-                                    
-                                    // Hide messages and input
-                                    messagesContainer.style.display = 'none';
-                                    messagesContainer.classList.add('hidden');
-                                    input.style.display = 'none';
-                                    input.classList.add('hidden');
-                                    
-                                    // Update form fields visibility based on pre_chat_form
-                                    updateFormFieldsVisibility(settings);
-                                } else {
-                                    // Form not required, show messages (empty)
-                                    formContainer.classList.add('hidden');
-                                    formContainer.style.display = 'none';
-                                    messagesContainer.style.display = 'flex';
-                                    messagesContainer.classList.remove('hidden');
-                                    input.style.display = 'block';
-                                    input.classList.remove('hidden');
-                                    displayMessages(messagesData.messages);
-                                    var lastInboundFetched2 = getLatestInboundId(messagesData.messages);
-                                    if (lastInboundFetched2 != null) {
-                                        setLastSeenMessageId(lastInboundFetched2);
-                                        void markSeenUpTo(lastInboundFetched2);
-                                    }
-                                }
+                    } else {
+                        applyMessagesPaneView('loading');
+                        try {
+                            if (messagesEntryPrefetchPromise) {
+                                await messagesEntryPrefetchPromise;
                             } else {
-                                // Conversation exists, show messages directly
-                                widgetState.messagesLoaded = true;
-                                formContainer.classList.add('hidden');
-                                formContainer.style.display = 'none';
-                                messagesContainer.style.display = 'flex';
-                                messagesContainer.classList.remove('hidden');
-                                input.style.display = 'block';
-                                input.classList.remove('hidden');
-                                displayMessages(messagesData.messages);
+                                await ensureMessagesEntryState();
                             }
+                            var resolvedView = resolveMessagesEntryViewFromState() || 'conversation';
+                            applyMessagesPaneView(resolvedView);
+                            if (resolvedView === 'conversation') {
+                                finalizeConversationPane(widgetState.messages);
+                            }
+                            startMessagePolling(5000);
+                            updateBottomNavActive('messages');
+                        } catch (error) {
+                            cwError('Error loading messages:', error);
+                            applyMessagesPaneView('conversation');
+                            finalizeConversationPane([]);
+                            startMessagePolling(5000);
+                            updateBottomNavActive('messages');
                         }
-                        
-                        widgetState.currentScreen = 'messages';
-                        // Keep messages fresh while the widget is open.
-                        startMessagePolling(5000);
-                        updateBottomNavActive('messages');
-                    } catch (error) {
-                        cwError('Error loading messages:', error);
-                        // Hide loader on error
-                        if (loaderContainer) {
-                            loaderContainer.style.display = 'none';
-                        }
-                        // Show error state or fallback
-                        formContainer.classList.add('hidden');
-                        formContainer.style.display = 'none';
-                        messagesContainer.style.display = 'flex';
-                        messagesContainer.classList.remove('hidden');
-                        displayMessages([]);
-                        startMessagePolling(5000);
-                        widgetState.currentScreen = 'messages';
-                        updateBottomNavActive('messages');
                     }
                 }
             }
@@ -5440,20 +6141,13 @@
             e.preventDefault();
             const nameField = document.getElementById('formName');
             const emailField = document.getElementById('formEmail');
-            const subjectField = document.getElementById('formSubject');
             const phoneField = document.getElementById('formPhone');
             const messageField = document.getElementById('formMessage');
             
             const name = nameField ? nameField.value.trim() : '';
             const email = emailField ? emailField.value.trim() : '';
-            const subject = subjectField ? subjectField.value.trim() : '';
             const phone = phoneField ? phoneField.value.trim() : '';
-            let message = messageField ? messageField.value.trim() : '';
-            if (subject && message) {
-                message = 'Subject: ' + subject + '\n\n' + message;
-            } else if (subject && !message) {
-                message = 'Subject: ' + subject;
-            }
+            const message = messageField ? messageField.value.trim() : '';
             
             // Check if required fields are filled (only check fields that are visible/required)
             let isValid = true;
@@ -5511,12 +6205,7 @@
                         
                         // On successful send, hide form and show messages
                         formContainer.classList.remove('active');
-                        formContainer.classList.add('hidden');
-                        formContainer.style.display = 'none';
-                        messagesContainer.style.display = 'flex';
-                        messagesContainer.classList.remove('hidden');
-                        input.style.display = 'block';
-                        input.classList.remove('hidden');
+                        applyMessagesPaneView('conversation');
                         
                         // Fetch and display messages from API
                         const messagesData = await fetchMessages();
@@ -5525,8 +6214,9 @@
                         widgetState.messages = messagesData.messages;
                         widgetState.conversationNumber = messagesData.conversation_number;
                         widgetState.messagesLoaded = true;
+                        widgetState.formRequired = false;
                         
-                        displayMessages(messagesData.messages);
+                        finalizeConversationPane(messagesData.messages);
                     } catch (error) {
                         cwError('Error sending form message:', error);
                         // Re-enable submit button on error
