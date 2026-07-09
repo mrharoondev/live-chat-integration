@@ -262,6 +262,7 @@
         conversationNumber: null,
         formRequired: null,
         widgetSettings: null,
+        visitorChatPolicy: 'single',
         currentScreen: null,
         messagesLoaded: false,
         attachments: {}, // Store uploaded attachments: { fileId: path }
@@ -280,6 +281,7 @@
             conversationNumber: null,
             formRequired: null,
             widgetSettings: null,
+            visitorChatPolicy: 'single',
             currentScreen: null,
             messagesLoaded: false,
             attachments: {},
@@ -535,12 +537,29 @@
             };
         }
         if (bc.driver === 'reverb') {
-            var useTls = (bc.scheme || 'http') === 'https';
+            // If the widget is served over HTTPS, browsers will block ws:// as mixed content.
+            // Prefer the current page protocol when deciding TLS.
+            var useTls = (typeof window !== 'undefined' && window.location && window.location.protocol === 'https:') || (bc.scheme || 'http') === 'https';
             var port = parseInt(bc.ws_port || '8080', 10);
+            var host = bc.ws_host || '';
+            // If backend returns localhost/127.0.0.1, prefer the API domain hostname first.
+            // Using the current page hostname breaks embeds where the widget host != backend host.
+            try {
+                var pageHost = window.location && window.location.hostname ? String(window.location.hostname) : '';
+                var apiHost = '';
+                try {
+                    if (apiDomain) apiHost = new URL(apiDomain).hostname || '';
+                } catch (e2) {}
+                if (!host || host === '127.0.0.1' || host === 'localhost' || host === '[::1]') {
+                    if (apiHost) host = apiHost;
+                    else if (pageHost) host = pageHost;
+                }
+            } catch (e) {}
+            if (!host) host = '127.0.0.1';
             return {
                 key: bc.key,
                 opts: Object.assign({}, base, {
-                    wsHost: bc.ws_host || '127.0.0.1',
+                    wsHost: host,
                     wsPort: port,
                     wssPort: port,
                     forceTLS: useTls,
@@ -620,6 +639,7 @@
             ch.unbind('message-read-status-updated');
             ch.unbind('conversation-typing');
             ch.unbind('conversation-assignment-updated');
+            ch.unbind('webrtc-signal');
             ch.bind('message-received', function(data) {
                 if (!data || String(data.conversation_number) !== String(conv)) {
                     return;
@@ -651,6 +671,9 @@
                 fetchMessages().then(function(messagesData) {
                     applyRealtimeMessageListUpdate(messagesData, conv);
                 }).catch(function() {});
+            });
+            ch.bind('webrtc-signal', function(data) {
+                void handleVisitorWebRtcSignal(data);
             });
             startRealtimeWatchdog();
             bindRealtimeVisibilityHandler();
@@ -905,6 +928,17 @@
             applyBroadcastingFromPayload(data);
             syncAssignedAgentFromPayload(data);
 
+            if (data.visitor_chat_policy) {
+                widgetState.visitorChatPolicy = data.visitor_chat_policy;
+            }
+            if (Object.prototype.hasOwnProperty.call(data, 'conversation_number')) {
+                widgetState.conversationNumber = data.conversation_number || null;
+                if (!data.conversation_number) {
+                    widgetState.messages = [];
+                    widgetState.messagesLoaded = true;
+                }
+            }
+
             // Mark secure upgrade as done only when backend actually verified identity.
             // If init fell back to guest (e.g. temporary hash mismatch / stale config), keep retrying.
             if (hasSecureIdentityReady()) {
@@ -923,6 +957,9 @@
                 new_token: data.new_token,
                 has_existing_conversation: data.has_existing_conversation,
                 conversation_number: data.conversation_number,
+                visitor_chat_policy: data.visitor_chat_policy || widgetState.visitorChatPolicy || 'single',
+                has_active_conversation: data.has_active_conversation === true,
+                can_start_new_chat: data.can_start_new_chat === true,
                 contact_id: data.contact_id,
                 is_new_visitor: data.is_new_visitor,
                 secure_verified: data.secure_verified === true,
@@ -1022,6 +1059,577 @@
         loadTailwindAndInit();
     }
 
+    var webrtcPeerConnection = null;
+    var webrtcLocalStream = null;
+    var webrtcRemoteAudioEl = null;
+    var webrtcActiveCallId = null;
+    var webrtcPendingOffer = null;
+    var webrtcPendingIceCandidates = null;
+    var webrtcIceServersCache = null;
+    var webrtcInitPromise = null;
+    var webrtcCallTimerId = null;
+    var webrtcConnectedAt = null;
+
+    function isVoiceCallsEnabled() {
+        var cfg = null;
+        try { cfg = getApiConfig(); } catch (e) {}
+        if (cfg && cfg.voiceCallEnabled === true) return true;
+        var settings = widgetState && widgetState.widgetSettings;
+        return !!(settings && settings.voice_call_enabled === true);
+    }
+
+    function formatVisitorCallDuration(totalSeconds) {
+        var secs = Math.max(0, Math.floor(totalSeconds || 0));
+        var mins = Math.floor(secs / 60);
+        var rem = secs % 60;
+        return String(mins).padStart(2, '0') + ':' + String(rem).padStart(2, '0');
+    }
+
+    function updateVisitorCallBannerTimer() {
+        var subEl = document.getElementById('cwVoiceCallBannerSub');
+        if (!subEl || !webrtcConnectedAt) return;
+        var elapsed = Math.floor((Date.now() - webrtcConnectedAt) / 1000);
+        subEl.textContent = 'Connected · ' + formatVisitorCallDuration(elapsed);
+    }
+
+    function stopVisitorCallTimer() {
+        if (webrtcCallTimerId) {
+            clearInterval(webrtcCallTimerId);
+            webrtcCallTimerId = null;
+        }
+        webrtcConnectedAt = null;
+    }
+
+    function startVisitorCallTimer() {
+        if (webrtcCallTimerId) {
+            clearInterval(webrtcCallTimerId);
+            webrtcCallTimerId = null;
+        }
+        if (!webrtcConnectedAt) {
+            webrtcConnectedAt = Date.now();
+        }
+        updateVisitorCallBannerTimer();
+        webrtcCallTimerId = setInterval(updateVisitorCallBannerTimer, 1000);
+    }
+
+    function markVisitorCallConnected() {
+        startVisitorCallTimer();
+        showVisitorIncomingCallUi('connected');
+    }
+
+    function generateWebRtcCallId() {
+        return 'call_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+    }
+
+    function normalizeWebRtcSdpString(sdp) {
+        var text = String(sdp || '').trim();
+        if (!text) return '';
+
+        if (text.indexOf('\\n') !== -1 || text.indexOf('\\r') !== -1) {
+            text = text.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '\n');
+        }
+
+        text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        if (text.indexOf('\n') === -1 && /\s(m=|a=|c=|b=)/.test(text)) {
+            text = text
+                .replace(/\s(?=m=)/g, '\n')
+                .replace(/\s(?=a=)/g, '\n')
+                .replace(/\s(?=c=)/g, '\n')
+                .replace(/\s(?=b=)/g, '\n');
+        }
+
+        var lines = text.split('\n').map(function (line) { return line.replace(/\s+$/, ''); }).filter(function (line) {
+            return line.length > 0 && line.indexOf('a=ssrc:') !== 0 && line.indexOf('a=ssrc-group:') !== 0;
+        });
+
+        return lines.join('\r\n') + '\r\n';
+    }
+
+    function normalizeWebRtcSessionDescription(input, fallbackType) {
+        if (!input) return null;
+
+        if (typeof input === 'string') {
+            var sdpOnly = normalizeWebRtcSdpString(input);
+            return sdpOnly ? { type: fallbackType, sdp: sdpOnly } : null;
+        }
+
+        if (typeof input !== 'object') return null;
+
+        var nested = input.sdp;
+        if (nested && typeof nested === 'object' && nested.sdp) {
+            return normalizeWebRtcSessionDescription(nested, input.type || fallbackType);
+        }
+
+        var sdpText = '';
+        if (typeof input.sdp === 'string') {
+            sdpText = normalizeWebRtcSdpString(input.sdp);
+        } else if (typeof nested === 'string') {
+            sdpText = normalizeWebRtcSdpString(nested);
+        }
+
+        if (!sdpText) return null;
+        return { type: input.type || fallbackType, sdp: sdpText };
+    }
+
+    function serializeWebRtcSessionDescription(desc) {
+        if (!desc) return null;
+        return normalizeWebRtcSessionDescription(desc, desc.type || 'offer');
+    }
+
+    function toWebRtcSessionDescription(input, fallbackType) {
+        var normalized = normalizeWebRtcSessionDescription(input, fallbackType);
+        if (!normalized) {
+            throw new Error('Invalid remote session description');
+        }
+        return new RTCSessionDescription(normalized);
+    }
+
+    function buildVisitorAuthHeaders(session) {
+        if (!session) return null;
+        var headers = { 'Accept': 'application/json' };
+        if (session.token) {
+            headers.Authorization = 'Bearer ' + session.token;
+        } else if (session.session_key) {
+            headers['X-Session-Key'] = session.session_key;
+        } else {
+            return null;
+        }
+        return headers;
+    }
+
+    async function fetchWebRtcIceServers() {
+        if (webrtcIceServersCache) return webrtcIceServersCache;
+        var url = getChannelApiUrl() + '/webrtc/ice-servers';
+        var session = await initializeChatSession(false);
+        var headers = buildVisitorAuthHeaders(session);
+        if (!headers) return null;
+        var response = await fetch(url, { method: 'GET', headers: headers });
+        if (response.status === 401) {
+            session = await initializeChatSession(true);
+            headers = buildVisitorAuthHeaders(session);
+            if (!headers) return null;
+            response = await fetch(url, { method: 'GET', headers: headers });
+        }
+        if (!response.ok) return null;
+        var data = await response.json();
+        webrtcIceServersCache = data.ice_servers || null;
+        return webrtcIceServersCache;
+    }
+
+    async function postWebRtcSignal(payload) {
+        var url = getChannelApiUrl() + '/webrtc/signal';
+        var session = await initializeChatSession(false);
+        var headers = buildVisitorAuthHeaders(session);
+        if (!headers) return false;
+        headers['Content-Type'] = 'application/json';
+        var response = await fetch(url, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(payload)
+        });
+        if (response.status === 401) {
+            session = await initializeChatSession(true);
+            headers = buildVisitorAuthHeaders(session);
+            if (!headers) return false;
+            headers['Content-Type'] = 'application/json';
+            response = await fetch(url, {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify(payload)
+            });
+        }
+        return response.ok;
+    }
+
+    function ensureVisitorVoiceCallBanner() {
+        var banner = document.getElementById('cwVoiceCallBanner');
+        if (banner) return banner;
+        banner = document.createElement('div');
+        banner.id = 'cwVoiceCallBanner';
+        banner.className = 'cw-voice-call-banner hidden';
+        banner.innerHTML =
+            '<div class="cw-voice-call-banner-inner">' +
+                '<div class="cw-voice-call-banner-text">' +
+                    '<span id="cwVoiceCallBannerTitle">Incoming voice call</span>' +
+                    '<span class="cw-voice-call-banner-sub" id="cwVoiceCallBannerSub">Agent is calling you</span>' +
+                '</div>' +
+                '<div class="cw-voice-call-actions" id="cwVoiceCallRingingActions">' +
+                    '<button type="button" class="cw-voice-call-accept" id="cwVoiceCallAcceptBtn" title="Answer call" aria-label="Answer call">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .3 2 .7 2.9a2 2 0 0 1-.5 2.1L8 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.5c.9.4 1.9.6 2.9.7A2 2 0 0 1 22 16.9Z"/></svg>' +
+                    '</button>' +
+                    '<button type="button" class="cw-voice-call-decline" id="cwVoiceCallDeclineBtn" title="Decline call" aria-label="Decline call">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>' +
+                    '</button>' +
+                '</div>' +
+                '<button type="button" class="cw-voice-call-end hidden" id="cwVoiceCallEndBtn">End call</button>' +
+            '</div>';
+        var widget = document.getElementById('chatWidget');
+        if (widget) {
+            widget.insertBefore(banner, widget.firstChild);
+        }
+        var acceptBtn = document.getElementById('cwVoiceCallAcceptBtn');
+        if (acceptBtn) {
+            acceptBtn.addEventListener('click', function () {
+                void acceptVisitorWebRtcCall();
+            });
+        }
+        var declineBtn = document.getElementById('cwVoiceCallDeclineBtn');
+        if (declineBtn) {
+            declineBtn.addEventListener('click', function () {
+                void declineVisitorWebRtcCall();
+            });
+        }
+        var endBtn = document.getElementById('cwVoiceCallEndBtn');
+        if (endBtn) {
+            endBtn.addEventListener('click', function () {
+                void endVisitorWebRtcCall(true);
+            });
+        }
+        return banner;
+    }
+
+    function setVisitorCallBannerMode(mode) {
+        var banner = ensureVisitorVoiceCallBanner();
+        var titleEl = document.getElementById('cwVoiceCallBannerTitle');
+        var subEl = document.getElementById('cwVoiceCallBannerSub');
+        var ringingActions = document.getElementById('cwVoiceCallRingingActions');
+        var endBtn = document.getElementById('cwVoiceCallEndBtn');
+        var acceptBtn = document.getElementById('cwVoiceCallAcceptBtn');
+        var declineBtn = document.getElementById('cwVoiceCallDeclineBtn');
+
+        if (mode === 'ringing') {
+            if (titleEl) titleEl.textContent = 'Incoming voice call';
+            if (subEl) subEl.textContent = 'Tap answer to join';
+            if (ringingActions) ringingActions.classList.remove('hidden');
+            if (endBtn) endBtn.classList.add('hidden');
+            if (acceptBtn) acceptBtn.disabled = false;
+            if (declineBtn) declineBtn.disabled = false;
+        } else if (mode === 'connecting') {
+            if (titleEl) titleEl.textContent = 'Connecting…';
+            if (subEl) subEl.textContent = 'Setting up your microphone';
+            if (ringingActions) ringingActions.classList.add('hidden');
+            if (endBtn) endBtn.classList.remove('hidden');
+        } else if (mode === 'outbound') {
+            if (titleEl) titleEl.textContent = 'Calling agent…';
+            if (subEl) subEl.textContent = 'Waiting for agent to answer';
+            if (ringingActions) ringingActions.classList.add('hidden');
+            if (endBtn) endBtn.classList.remove('hidden');
+        } else if (mode === 'connected') {
+            if (titleEl) titleEl.textContent = 'On a voice call';
+            if (subEl && !webrtcConnectedAt) subEl.textContent = 'Connected';
+            updateVisitorCallBannerTimer();
+            if (ringingActions) ringingActions.classList.add('hidden');
+            if (endBtn) endBtn.classList.remove('hidden');
+        }
+
+        if (banner) banner.classList.remove('hidden');
+    }
+
+    function showVisitorIncomingCallUi(mode) {
+        setVisitorCallBannerMode(mode || 'ringing');
+        try {
+            if (typeof chatWidget !== 'undefined' && chatWidget && typeof chatWidget.showScreen === 'function') {
+                chatWidget.showScreen('messages');
+            }
+        } catch (e) {}
+        try {
+            if (typeof chatWidget !== 'undefined' && chatWidget && typeof chatWidget.toggleChat === 'function') {
+                var widget = document.getElementById('chatWidget');
+                if (widget && widget.classList.contains('hidden')) {
+                    chatWidget.toggleChat();
+                }
+            }
+        } catch (e) {}
+    }
+
+    function hideVisitorIncomingCallUi() {
+        var banner = document.getElementById('cwVoiceCallBanner');
+        if (banner) banner.classList.add('hidden');
+    }
+
+    function detachVisitorPeerConnectionHandlers(pc) {
+        if (!pc) return;
+        try {
+            pc.onconnectionstatechange = null;
+            pc.oniceconnectionstatechange = null;
+            pc.onicecandidate = null;
+            pc.ontrack = null;
+        } catch (e) {}
+    }
+
+    async function drainVisitorPendingIceCandidates(pc) {
+        if (!pc || !webrtcPendingIceCandidates || !webrtcPendingIceCandidates.length) return;
+        var queued = webrtcPendingIceCandidates.slice();
+        webrtcPendingIceCandidates = null;
+        for (var i = 0; i < queued.length; i++) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(queued[i])); } catch (e) {}
+        }
+    }
+
+    function stopVisitorWebRtcMedia() {
+        if (webrtcLocalStream) {
+            try {
+                webrtcLocalStream.getTracks().forEach(function (track) { track.stop(); });
+            } catch (e) {}
+            webrtcLocalStream = null;
+        }
+        if (webrtcRemoteAudioEl) {
+            try {
+                webrtcRemoteAudioEl.pause();
+                webrtcRemoteAudioEl.srcObject = null;
+                if (webrtcRemoteAudioEl.parentNode) {
+                    webrtcRemoteAudioEl.parentNode.removeChild(webrtcRemoteAudioEl);
+                }
+            } catch (e) {}
+            webrtcRemoteAudioEl = null;
+        }
+        if (webrtcPeerConnection) {
+            var closingPc = webrtcPeerConnection;
+            detachVisitorPeerConnectionHandlers(closingPc);
+            try { closingPc.close(); } catch (e) {}
+            webrtcPeerConnection = null;
+        }
+        webrtcActiveCallId = null;
+    }
+
+    function cleanupVisitorWebRtcMedia() {
+        stopVisitorCallTimer();
+        stopVisitorWebRtcMedia();
+        webrtcPendingOffer = null;
+        webrtcPendingIceCandidates = null;
+        hideVisitorIncomingCallUi();
+        syncComposerVoiceCallButton();
+    }
+
+    async function createVisitorPeerConnection(callId) {
+        var iceServers = await fetchWebRtcIceServers();
+        if (!iceServers || !iceServers.length) {
+            throw new Error('ICE servers unavailable');
+        }
+        stopVisitorWebRtcMedia();
+        webrtcActiveCallId = callId;
+        var pc = new RTCPeerConnection({ iceServers: iceServers });
+        webrtcPeerConnection = pc;
+        pc.ontrack = function (event) {
+            if (webrtcPeerConnection !== pc) return;
+            if (!event.streams || !event.streams[0]) return;
+            if (!webrtcRemoteAudioEl) {
+                webrtcRemoteAudioEl = document.createElement('audio');
+                webrtcRemoteAudioEl.autoplay = true;
+                webrtcRemoteAudioEl.playsInline = true;
+                webrtcRemoteAudioEl.style.display = 'none';
+                document.body.appendChild(webrtcRemoteAudioEl);
+            }
+            webrtcRemoteAudioEl.srcObject = event.streams[0];
+            void webrtcRemoteAudioEl.play().catch(function () {});
+            markVisitorCallConnected();
+        };
+        pc.onicecandidate = function (event) {
+            if (webrtcPeerConnection !== pc) return;
+            if (!event.candidate || !widgetState.conversationNumber || !webrtcActiveCallId) return;
+            void postWebRtcSignal({
+                type: 'ice-candidate',
+                from: 'visitor',
+                call_id: webrtcActiveCallId,
+                conversation_number: String(widgetState.conversationNumber),
+                candidate: event.candidate.toJSON()
+            });
+        };
+        pc.onconnectionstatechange = function () {
+            if (webrtcPeerConnection !== pc) return;
+            if (pc.connectionState === 'connected') {
+                markVisitorCallConnected();
+            } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                void endVisitorWebRtcCall(false);
+            }
+        };
+        pc.oniceconnectionstatechange = function () {
+            if (webrtcPeerConnection !== pc) return;
+            if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                markVisitorCallConnected();
+            } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+                void endVisitorWebRtcCall(false);
+            }
+        };
+        webrtcLocalStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        webrtcLocalStream.getTracks().forEach(function (track) {
+            webrtcPeerConnection.addTrack(track, webrtcLocalStream);
+        });
+        return webrtcPeerConnection;
+    }
+
+    async function acceptVisitorWebRtcCall() {
+        if (!webrtcPendingOffer || !widgetState.conversationNumber) return;
+        var offer = webrtcPendingOffer;
+        webrtcPendingOffer = null;
+        var acceptBtn = document.getElementById('cwVoiceCallAcceptBtn');
+        var declineBtn = document.getElementById('cwVoiceCallDeclineBtn');
+        if (acceptBtn) acceptBtn.disabled = true;
+        if (declineBtn) declineBtn.disabled = true;
+        showVisitorIncomingCallUi('connecting');
+        try {
+            var pc = await createVisitorPeerConnection(offer.call_id);
+            await pc.setRemoteDescription(toWebRtcSessionDescription(offer.sdp, 'offer'));
+            await drainVisitorPendingIceCandidates(pc);
+            var answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await postWebRtcSignal({
+                type: 'call-answer',
+                from: 'visitor',
+                call_id: offer.call_id,
+                conversation_number: String(widgetState.conversationNumber),
+                sdp: serializeWebRtcSessionDescription(pc.localDescription)
+            });
+            markVisitorCallConnected();
+        } catch (e) {
+            cwError('ChatWidget: accept WebRTC call failed', e);
+            notifyUser('Could not join the voice call. Please allow microphone access and try again.');
+            await endVisitorWebRtcCall(true);
+        }
+    }
+
+    async function declineVisitorWebRtcCall() {
+        var pendingId = webrtcPendingOffer ? webrtcPendingOffer.call_id : null;
+        webrtcPendingOffer = null;
+        stopVisitorWebRtcMedia();
+        hideVisitorIncomingCallUi();
+        syncComposerVoiceCallButton();
+        if (pendingId && widgetState.conversationNumber) {
+            await postWebRtcSignal({
+                type: 'hangup',
+                from: 'visitor',
+                call_id: pendingId,
+                conversation_number: String(widgetState.conversationNumber)
+            });
+        }
+    }
+
+    async function handleVisitorWebRtcSignal(data) {
+        if (!data || data.from === 'visitor') return;
+        if (!widgetState.conversationNumber || String(data.conversation_number) !== String(widgetState.conversationNumber)) return;
+        if (!isVoiceCallsEnabled()) return;
+
+        try {
+            if (data.type === 'call-offer') {
+                if (webrtcPeerConnection || webrtcActiveCallId) return;
+                stopVisitorWebRtcMedia();
+                webrtcPendingOffer = {
+                    call_id: data.call_id,
+                    sdp: normalizeWebRtcSessionDescription(data.sdp, 'offer')
+                };
+                webrtcPendingIceCandidates = [];
+                showVisitorIncomingCallUi('ringing');
+            } else if (data.type === 'call-answer' && webrtcPeerConnection && data.call_id === webrtcActiveCallId && data.sdp) {
+                await webrtcPeerConnection.setRemoteDescription(toWebRtcSessionDescription(data.sdp, 'answer'));
+                await drainVisitorPendingIceCandidates(webrtcPeerConnection);
+                markVisitorCallConnected();
+            } else if (data.type === 'ice-candidate' && data.call_id && data.candidate) {
+                // ICE can arrive while we're still ringing (no peer yet) or before remoteDescription is set.
+                if (webrtcPendingOffer && data.call_id === webrtcPendingOffer.call_id) {
+                    if (!webrtcPendingIceCandidates) webrtcPendingIceCandidates = [];
+                    webrtcPendingIceCandidates.push(data.candidate);
+                    return;
+                }
+                if (webrtcPeerConnection && data.call_id === webrtcActiveCallId) {
+                    if (!webrtcPeerConnection.remoteDescription) {
+                        if (!webrtcPendingIceCandidates) webrtcPendingIceCandidates = [];
+                        webrtcPendingIceCandidates.push(data.candidate);
+                        return;
+                    }
+                    try {
+                        await webrtcPeerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    } catch (iceErr) {
+                        cwWarn('ChatWidget: ignored ICE candidate', iceErr);
+                    }
+                }
+            } else if (data.type === 'hangup') {
+                var matchesActive = data.call_id === webrtcActiveCallId;
+                var matchesPending = webrtcPendingOffer && data.call_id === webrtcPendingOffer.call_id;
+                if (matchesActive || matchesPending) {
+                    await endVisitorWebRtcCall(false);
+                }
+            }
+        } catch (e) {
+            cwError('ChatWidget: WebRTC signal handling failed', e);
+            await endVisitorWebRtcCall(false);
+        }
+    }
+
+    async function startVisitorOutboundCall() {
+        if (!isVoiceCallsEnabled()) return;
+        if (!widgetState.conversationNumber) {
+            notifyUser('Send a message first, then you can call the agent.');
+            return;
+        }
+        if (webrtcPeerConnection || webrtcPendingOffer || webrtcActiveCallId) return;
+
+        showVisitorIncomingCallUi('outbound');
+        syncComposerVoiceCallButton();
+        try {
+            await maybeInitVisitorWebRtc();
+            var callId = generateWebRtcCallId();
+            var pc = await createVisitorPeerConnection(callId);
+            var offer = await pc.createOffer({ offerToReceiveAudio: true });
+            await pc.setLocalDescription(offer);
+            await postWebRtcSignal({
+                type: 'call-offer',
+                from: 'visitor',
+                call_id: callId,
+                conversation_number: String(widgetState.conversationNumber),
+                sdp: serializeWebRtcSessionDescription(pc.localDescription)
+            });
+        } catch (e) {
+            cwError('ChatWidget: outbound WebRTC call failed', e);
+            notifyUser('Could not start the voice call. Please allow microphone access and try again.');
+            await endVisitorWebRtcCall(true);
+        }
+    }
+
+    function syncComposerVoiceCallButton() {
+        var btn = document.getElementById('cwComposerCallBtn');
+        if (!btn) return;
+        var enabled = isVoiceCallsEnabled();
+        var inCall = Boolean(webrtcPeerConnection || webrtcPendingOffer || webrtcActiveCallId);
+        var hasConversation = Boolean(widgetState.conversationNumber);
+        var onMessages = widgetState.currentScreen === 'messages';
+        if (enabled && hasConversation && onMessages) {
+            btn.classList.remove('hidden');
+            btn.disabled = inCall;
+            btn.title = inCall ? 'Call in progress' : 'Call agent';
+        } else {
+            btn.classList.add('hidden');
+            btn.disabled = false;
+        }
+    }
+
+    async function endVisitorWebRtcCall(sendHangup) {
+        var callId = webrtcActiveCallId || (webrtcPendingOffer ? webrtcPendingOffer.call_id : null);
+        cleanupVisitorWebRtcMedia();
+        if (sendHangup && callId && widgetState.conversationNumber) {
+            await postWebRtcSignal({
+                type: 'hangup',
+                from: 'visitor',
+                call_id: callId,
+                conversation_number: String(widgetState.conversationNumber)
+            });
+        }
+    }
+
+    async function maybeInitVisitorWebRtc() {
+        if (!isVoiceCallsEnabled()) return;
+        if (webrtcInitPromise) return webrtcInitPromise;
+        webrtcInitPromise = (async function () {
+            try {
+                await fetchWebRtcIceServers();
+            } catch (e) {
+                cwError('ChatWidget: WebRTC init failed', e);
+                webrtcInitPromise = null;
+            }
+        })();
+        return webrtcInitPromise;
+    }
+
     function initWidget() {
         injectStyles();
         createWidget();
@@ -1034,6 +1642,7 @@
             if (session && session.token) {
                 queueMicrotask(function () {
                     startVisitorPageAndPresenceTracking();
+                    void maybeInitVisitorWebRtc();
                 });
             }
             return prefetchMessagesEntryState();
@@ -2844,6 +3453,100 @@
                     }
                 }
             }
+
+            .cw-voice-call-banner {
+                background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
+                color: #fff;
+                padding: 12px 14px;
+                font-size: 13px;
+                z-index: 5;
+                box-shadow: 0 2px 8px rgba(15, 118, 110, 0.25);
+            }
+            .cw-voice-call-banner.hidden {
+                display: none;
+            }
+            .cw-voice-call-banner-inner {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+            .cw-voice-call-banner-text {
+                flex: 1;
+                min-width: 0;
+                font-weight: 600;
+                line-height: 1.35;
+            }
+            .cw-voice-call-banner-sub {
+                display: block;
+                margin-top: 2px;
+                font-size: 11px;
+                font-weight: 400;
+                opacity: 0.9;
+            }
+            .cw-voice-call-actions {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                flex-shrink: 0;
+            }
+            .cw-voice-call-actions.hidden {
+                display: none;
+            }
+            .cw-voice-call-accept,
+            .cw-voice-call-decline,
+            .cw-voice-call-end {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 36px;
+                height: 36px;
+                border: none;
+                border-radius: 9999px;
+                cursor: pointer;
+                transition: transform 0.15s ease, opacity 0.15s ease;
+            }
+            .cw-voice-call-accept:hover,
+            .cw-voice-call-decline:hover,
+            .cw-voice-call-end:hover {
+                transform: scale(1.05);
+            }
+            .cw-voice-call-accept {
+                background: #22c55e;
+                color: #fff;
+                box-shadow: 0 2px 8px rgba(34, 197, 94, 0.45);
+            }
+            .cw-voice-call-decline {
+                background: #ef4444;
+                color: #fff;
+                box-shadow: 0 2px 8px rgba(239, 68, 68, 0.45);
+            }
+            .cw-voice-call-end {
+                width: auto;
+                min-width: 72px;
+                padding: 0 12px;
+                border-radius: 8px;
+                background: rgba(255,255,255,0.18);
+                border: 1px solid rgba(255,255,255,0.45);
+                color: #fff;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .cw-voice-call-end.hidden {
+                display: none;
+            }
+            .cw-voice-call-accept svg,
+            .cw-voice-call-decline svg {
+                width: 18px;
+                height: 18px;
+            }
+            .cw-ms-icon-btn.hidden {
+                display: none;
+            }
+            .cw-ms-icon-btn:disabled {
+                opacity: 0.45;
+                cursor: not-allowed;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -3142,7 +3845,10 @@
                                     </button>
                                 </div>
                                 <div class="cw-ms-toolbar-group">
-                                    <button type="button" class="cw-ms-icon-btn" title="Send voice message" aria-hidden="true" tabindex="-1">
+                                    <button type="button" id="cwComposerCallBtn" class="cw-ms-icon-btn hidden" title="Call agent" onclick="chatWidget.startVoiceCall()" aria-label="Call agent">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .3 2 .7 2.9a2 2 0 0 1-.5 2.1L8 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.5c.9.4 1.9.6 2.9.7A2 2 0 0 1 22 16.9Z"/></svg>
+                                    </button>
+                                    <button type="button" class="cw-ms-icon-btn" title="Send voice message" aria-hidden="true" tabindex="-1" style="display:none">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
                                     </button>
                                     <button type="button" class="cw-ms-send-btn" id="sendButton" onclick="chatWidget.sendMsg()" title="Send" aria-label="Send">
@@ -4327,6 +5033,9 @@
         var prevConv = widgetState.conversationNumber != null ? String(widgetState.conversationNumber) : '';
         if (Object.prototype.hasOwnProperty.call(data, 'conversation_number')) {
             widgetState.conversationNumber = data.conversation_number;
+            if (!data.conversation_number && widgetState.visitorChatPolicy === 'multiple') {
+                widgetState.messages = [];
+            }
         }
         syncAssignedAgentFromPayload(data);
         var nextConv = widgetState.conversationNumber != null ? String(widgetState.conversationNumber) : '';
@@ -4898,7 +5607,11 @@
         if (formSubtitle) formSubtitle.textContent = (titles && titles.sub_heading) ? titles.sub_heading : "We'll get back to you in a few hours.";
 
         widgetState.widgetSettings = settings;
+        if (settings.visitor_chat_policy) {
+            widgetState.visitorChatPolicy = settings.visitor_chat_policy;
+        }
         updateAssignedAgentBarUi();
+        syncComposerVoiceCallButton();
     }
 
     function openExternalAndClose(url) {
@@ -4955,6 +5668,9 @@
             widgetState.widgetSettings = fresh;
             if (applyWidgetSettingsAndGate(fresh)) {
                 scheduleWidgetAutoOpen(fresh);
+            }
+            if (isVoiceCallsEnabled()) {
+                void maybeInitVisitorWebRtc();
             }
         }
     }
@@ -5118,6 +5834,7 @@
             void markSeenUpTo(lastInbound);
         }
         updateAssignedAgentBarUi();
+        syncComposerVoiceCallButton();
     }
 
     async function ensureMessagesEntryState() {
@@ -5785,6 +6502,9 @@
                         if (response && Object.prototype.hasOwnProperty.call(response, 'conversation_number')) {
                             widgetState.conversationNumber = response.conversation_number;
                         }
+                        if (response && response.is_new_conversation) {
+                            widgetState.messages = [];
+                        }
                         syncAssignedAgentFromPayload(response || {});
                         clearAgentTypingUi();
                         void postVisitorTypingToApi(false);
@@ -5877,6 +6597,10 @@
                     b.classList.remove('enabled');
                 }
             }
+        },
+
+        startVoiceCall: function () {
+            void startVisitorOutboundCall();
         },
 
         toggleMessageMenu: function (event, menuId) {
@@ -6064,6 +6788,7 @@
                         }
                         startMessagePolling(5000);
                         updateBottomNavActive('messages');
+                        syncComposerVoiceCallButton();
                     } else {
                         applyMessagesPaneView('loading');
                         try {
@@ -6079,6 +6804,7 @@
                             }
                             startMessagePolling(5000);
                             updateBottomNavActive('messages');
+                            syncComposerVoiceCallButton();
                         } catch (error) {
                             cwError('Error loading messages:', error);
                             applyMessagesPaneView('conversation');
