@@ -1530,21 +1530,38 @@
                 candidate: event.candidate.toJSON()
             });
         };
+        var disconnectTimer = null;
+        function scheduleVisitorDisconnectHangup() {
+            if (disconnectTimer) return;
+            disconnectTimer = setTimeout(function () {
+                disconnectTimer = null;
+                if (webrtcPeerConnection !== pc) return;
+                var ice = pc.iceConnectionState;
+                var conn = pc.connectionState;
+                if (ice === 'connected' || ice === 'completed' || conn === 'connected') return;
+                void endVisitorWebRtcCall(true);
+            }, 2000);
+        }
         pc.onconnectionstatechange = function () {
             if (webrtcPeerConnection !== pc) return;
             if (pc.connectionState === 'connected') {
+                if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
                 markVisitorCallConnected();
             } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-                // Persist call log even when the peer drops unexpectedly.
                 void endVisitorWebRtcCall(true);
+            } else if (pc.connectionState === 'disconnected') {
+                scheduleVisitorDisconnectHangup();
             }
         };
         pc.oniceconnectionstatechange = function () {
             if (webrtcPeerConnection !== pc) return;
             if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
                 markVisitorCallConnected();
             } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
                 void endVisitorWebRtcCall(true);
+            } else if (pc.iceConnectionState === 'disconnected') {
+                scheduleVisitorDisconnectHangup();
             }
         };
         webrtcLocalStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -1605,7 +1622,11 @@
 
         try {
             if (data.type === 'call-offer') {
-                if (webrtcPeerConnection || webrtcActiveCallId) return;
+                var incomingCallId = data.call_id != null ? String(data.call_id) : '';
+                if (webrtcPeerConnection && webrtcActiveCallId) {
+                    if (incomingCallId && incomingCallId === String(webrtcActiveCallId)) return;
+                    await endVisitorWebRtcCall(false);
+                }
                 stopVisitorWebRtcMedia();
                 webrtcPendingOffer = {
                     call_id: data.call_id,
@@ -1613,18 +1634,23 @@
                 };
                 webrtcPendingIceCandidates = [];
                 showVisitorIncomingCallUi('ringing');
-            } else if (data.type === 'call-answer' && webrtcPeerConnection && data.call_id === webrtcActiveCallId && data.sdp) {
+            } else if (
+                data.type === 'call-answer' &&
+                webrtcPeerConnection &&
+                String(data.call_id) === String(webrtcActiveCallId) &&
+                data.sdp
+            ) {
                 await webrtcPeerConnection.setRemoteDescription(toWebRtcSessionDescription(data.sdp, 'answer'));
                 await drainVisitorPendingIceCandidates(webrtcPeerConnection);
                 markVisitorCallConnected();
             } else if (data.type === 'ice-candidate' && data.call_id && data.candidate) {
                 // ICE can arrive while we're still ringing (no peer yet) or before remoteDescription is set.
-                if (webrtcPendingOffer && data.call_id === webrtcPendingOffer.call_id) {
+                if (webrtcPendingOffer && String(data.call_id) === String(webrtcPendingOffer.call_id)) {
                     if (!webrtcPendingIceCandidates) webrtcPendingIceCandidates = [];
                     webrtcPendingIceCandidates.push(data.candidate);
                     return;
                 }
-                if (webrtcPeerConnection && data.call_id === webrtcActiveCallId) {
+                if (webrtcPeerConnection && String(data.call_id) === String(webrtcActiveCallId)) {
                     if (!webrtcPeerConnection.remoteDescription) {
                         if (!webrtcPendingIceCandidates) webrtcPendingIceCandidates = [];
                         webrtcPendingIceCandidates.push(data.candidate);
@@ -1637,8 +1663,11 @@
                     }
                 }
             } else if (data.type === 'hangup') {
-                var matchesActive = data.call_id === webrtcActiveCallId;
-                var matchesPending = webrtcPendingOffer && data.call_id === webrtcPendingOffer.call_id;
+                var hangupId = data.call_id != null ? String(data.call_id) : '';
+                var matchesActive = hangupId !== '' && hangupId === String(webrtcActiveCallId || '');
+                var matchesPending = hangupId !== '' && webrtcPendingOffer && hangupId === String(webrtcPendingOffer.call_id || '');
+                // Ignore hangups for other call ids (e.g. agent leftover outbound) so the
+                // active visitor call is not cancelled while the agent is still ringing.
                 if (matchesActive || matchesPending) {
                     await endVisitorWebRtcCall(false);
                 }
