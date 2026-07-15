@@ -8785,7 +8785,25 @@
             const chatInput = document.getElementById('chatInput');
             if (chatInput) {
                 var typingPulseTimer = null;
+                var typingKeepAliveId = null;
                 var typingActive = false;
+                function stopTypingKeepAlive() {
+                    if (typingKeepAliveId) {
+                        clearInterval(typingKeepAliveId);
+                        typingKeepAliveId = null;
+                    }
+                }
+                function startTypingKeepAlive() {
+                    stopTypingKeepAlive();
+                    typingKeepAliveId = setInterval(function() {
+                        if (!typingActive || document.activeElement !== chatInput) {
+                            stopTypingKeepAlive();
+                            return;
+                        }
+                        if (!widgetState.conversationNumber) return;
+                        void postVisitorTypingToApi(true);
+                    }, 2500);
+                }
                 chatInput.addEventListener('input', function() {
                     this.style.height = 'auto';
                     this.style.height = this.scrollHeight + 'px';
@@ -8797,6 +8815,7 @@
                         typingPulseTimer = setTimeout(function() {
                             typingActive = true;
                             void postVisitorTypingToApi(true);
+                            startTypingKeepAlive();
                         }, 450);
                     }
                 });
@@ -8805,6 +8824,7 @@
                         clearTimeout(typingPulseTimer);
                         typingPulseTimer = null;
                     }
+                    stopTypingKeepAlive();
                     if (typingActive || widgetState.conversationNumber) {
                         typingActive = false;
                         void postVisitorTypingToApi(false);
