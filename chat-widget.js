@@ -1069,6 +1069,7 @@
     var webrtcInitPromise = null;
     var webrtcCallTimerId = null;
     var webrtcConnectedAt = null;
+    var webrtcHangupSent = false;
 
     function isVoiceCallsEnabled() {
         var cfg = null;
@@ -1090,6 +1091,11 @@
         if (!subEl || !webrtcConnectedAt) return;
         var elapsed = Math.floor((Date.now() - webrtcConnectedAt) / 1000);
         subEl.textContent = 'Connected · ' + formatVisitorCallDuration(elapsed);
+    }
+
+    function visitorCallDurationSeconds() {
+        if (!webrtcConnectedAt) return 0;
+        return Math.max(0, Math.floor((Date.now() - webrtcConnectedAt) / 1000));
     }
 
     function stopVisitorCallTimer() {
@@ -1398,8 +1404,23 @@
         stopVisitorWebRtcMedia();
         webrtcPendingOffer = null;
         webrtcPendingIceCandidates = null;
+        webrtcHangupSent = false;
         hideVisitorIncomingCallUi();
         syncComposerVoiceCallButton();
+    }
+
+    async function postVisitorHangup(callId) {
+        if (!callId || !widgetState.conversationNumber || webrtcHangupSent) return;
+        webrtcHangupSent = true;
+        var duration = visitorCallDurationSeconds();
+        await postWebRtcSignal({
+            type: 'hangup',
+            from: 'visitor',
+            call_id: callId,
+            conversation_number: String(widgetState.conversationNumber),
+            media: 'voice',
+            duration: duration
+        });
     }
 
     async function createVisitorPeerConnection(callId) {
@@ -1441,7 +1462,8 @@
             if (pc.connectionState === 'connected') {
                 markVisitorCallConnected();
             } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-                void endVisitorWebRtcCall(false);
+                // Persist call log even when the peer drops unexpectedly.
+                void endVisitorWebRtcCall(true);
             }
         };
         pc.oniceconnectionstatechange = function () {
@@ -1449,13 +1471,14 @@
             if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
                 markVisitorCallConnected();
             } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
-                void endVisitorWebRtcCall(false);
+                void endVisitorWebRtcCall(true);
             }
         };
         webrtcLocalStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
         webrtcLocalStream.getTracks().forEach(function (track) {
             webrtcPeerConnection.addTrack(track, webrtcLocalStream);
         });
+        webrtcHangupSent = false;
         return webrtcPeerConnection;
     }
 
@@ -1479,6 +1502,7 @@
                 from: 'visitor',
                 call_id: offer.call_id,
                 conversation_number: String(widgetState.conversationNumber),
+                media: 'voice',
                 sdp: serializeWebRtcSessionDescription(pc.localDescription)
             });
             markVisitorCallConnected();
@@ -1495,14 +1519,10 @@
         stopVisitorWebRtcMedia();
         hideVisitorIncomingCallUi();
         syncComposerVoiceCallButton();
-        if (pendingId && widgetState.conversationNumber) {
-            await postWebRtcSignal({
-                type: 'hangup',
-                from: 'visitor',
-                call_id: pendingId,
-                conversation_number: String(widgetState.conversationNumber)
-            });
+        if (pendingId) {
+            await postVisitorHangup(pendingId);
         }
+        webrtcHangupSent = false;
     }
 
     async function handleVisitorWebRtcSignal(data) {
@@ -1577,6 +1597,7 @@
                 from: 'visitor',
                 call_id: callId,
                 conversation_number: String(widgetState.conversationNumber),
+                media: 'voice',
                 sdp: serializeWebRtcSessionDescription(pc.localDescription)
             });
         } catch (e) {
@@ -1605,15 +1626,11 @@
 
     async function endVisitorWebRtcCall(sendHangup) {
         var callId = webrtcActiveCallId || (webrtcPendingOffer ? webrtcPendingOffer.call_id : null);
-        cleanupVisitorWebRtcMedia();
-        if (sendHangup && callId && widgetState.conversationNumber) {
-            await postWebRtcSignal({
-                type: 'hangup',
-                from: 'visitor',
-                call_id: callId,
-                conversation_number: String(widgetState.conversationNumber)
-            });
+        // Capture duration before cleanup clears webrtcConnectedAt.
+        if (sendHangup && callId) {
+            await postVisitorHangup(callId);
         }
+        cleanupVisitorWebRtcMedia();
     }
 
     async function maybeInitVisitorWebRtc() {
@@ -1933,23 +1950,44 @@
                 z-index: 10;
                 background: #fff;
                 border-radius: 0 0 1rem 1rem;
+                overflow: hidden;
+                max-width: 100%;
+                box-sizing: border-box;
             }
             .cw-ms-composer {
                 border-top: 1px solid #e2e8f0;
+                overflow: hidden;
+                max-width: 100%;
+                box-sizing: border-box;
+            }
+            #inputWrapper {
+                min-width: 0;
+                max-width: 100%;
+                box-sizing: border-box;
+                overflow: hidden;
             }
             .cw-ms-footer .cw-ms-textarea {
                 display: block;
                 width: 100%;
+                max-width: 100%;
                 max-height: 9rem;
                 padding: 1rem 0.5rem 0.5rem 0.5rem;
+                margin: 0;
                 border: none;
                 background: transparent;
                 outline: none;
+                box-shadow: none;
                 resize: none;
                 font-size: 0.875rem;
                 line-height: 1.25rem;
                 color: #0f172a;
                 box-sizing: border-box;
+            }
+            .cw-ms-footer .cw-ms-textarea:focus,
+            .cw-ms-footer .cw-ms-textarea:focus-visible {
+                outline: none !important;
+                border: none !important;
+                box-shadow: none !important;
             }
             .cw-ms-footer .cw-ms-textarea::placeholder {
                 color: #94a3b8;
@@ -1959,7 +1997,9 @@
                 align-items: center;
                 justify-content: space-between;
                 gap: 0.25rem;
-                padding: 0 1rem 0.5rem 0;
+                padding: 0 0.5rem 0.5rem 0.5rem;
+                max-width: 100%;
+                box-sizing: border-box;
             }
             .cw-ms-footer .cw-ms-toolbar-group {
                 display: flex;
@@ -3540,6 +3580,244 @@
                 width: 18px;
                 height: 18px;
             }
+            .cw-call-log-bubble {
+                display: inline-flex;
+                flex-direction: column;
+                gap: 8px;
+                min-width: 200px;
+                max-width: 300px;
+                border-radius: 12px;
+                padding: 10px 12px;
+                box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+            }
+            .cw-call-log-bubble.cw-call-me {
+                border-bottom-right-radius: 4px;
+                background: #d8f3dc;
+            }
+            .cw-call-log-bubble.cw-call-them {
+                border-bottom-left-radius: 4px;
+                background: #f3f4f6;
+            }
+            .cw-call-log-row {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+            .cw-call-log-glyph {
+                width: 36px;
+                height: 36px;
+                border-radius: 9999px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                background: #d1fae5;
+                color: #047857;
+            }
+            .cw-call-log-glyph.cw-call-missed {
+                background: #fee2e2;
+                color: #dc2626;
+            }
+            .cw-call-log-glyph svg {
+                width: 18px;
+                height: 18px;
+            }
+            .cw-call-log-title {
+                margin: 0;
+                font-size: 13px;
+                font-weight: 600;
+                color: var(--text-color, #111827);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .cw-call-log-sub {
+                margin: 2px 0 0;
+                font-size: 11px;
+                color: #6b7280;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .cw-call-log-time {
+                align-self: flex-end;
+                font-size: 11px;
+                color: #6b7280;
+            }
+            .cw-voice-msg {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                min-width: 220px;
+                max-width: 300px;
+                padding: 6px 2px;
+                user-select: none;
+            }
+            .cw-voice-play {
+                width: 36px;
+                height: 36px;
+                border: none;
+                border-radius: 9999px;
+                background: transparent;
+                color: var(--cw-voice-accent, #25D366);
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                flex-shrink: 0;
+                padding: 0;
+            }
+            .cw-voice-play svg {
+                width: 22px;
+                height: 22px;
+            }
+            .cw-voice-play .hidden {
+                display: none;
+            }
+            .cw-voice-wave {
+                position: relative;
+                display: flex;
+                align-items: center;
+                gap: 2px;
+                height: 32px;
+                flex: 1;
+                min-width: 0;
+                cursor: pointer;
+                touch-action: none;
+            }
+            .cw-voice-bar {
+                flex: 1;
+                min-width: 2px;
+                border-radius: 9999px;
+                background: rgba(0, 0, 0, 0.18);
+                display: inline-block;
+                align-self: center;
+            }
+            .cw-voice-bar.is-played {
+                background: var(--cw-voice-accent, #25D366);
+            }
+            .cw-voice-knob {
+                position: absolute;
+                top: 50%;
+                width: 12px;
+                height: 12px;
+                margin-top: -6px;
+                margin-left: -6px;
+                border-radius: 9999px;
+                background: var(--cw-voice-accent, #25D366);
+                box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+                pointer-events: none;
+                left: 0%;
+            }
+            .cw-voice-dur {
+                font-size: 11px;
+                font-weight: 600;
+                color: rgba(0, 0, 0, 0.5);
+                min-width: 36px;
+                text-align: right;
+                font-variant-numeric: tabular-nums;
+            }
+            .cw-voice-mic {
+                width: 36px;
+                height: 36px;
+                border-radius: 9999px;
+                background: var(--cw-voice-accent, #25D366);
+                color: #fff;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+            }
+            .cw-voice-mic svg {
+                width: 18px;
+                height: 18px;
+            }
+            .cw-voice-msg.cw-voice-me {
+                --cw-voice-accent: #128C7E;
+            }
+            .cw-voice-msg.cw-voice-them {
+                --cw-voice-accent: #25D366;
+            }
+            .cw-video-msg {
+                position: relative;
+                max-width: 260px;
+                border-radius: 12px;
+                overflow: hidden;
+                background: #111827;
+            }
+            .cw-video-el {
+                display: block;
+                width: 100%;
+                max-height: 220px;
+                object-fit: contain;
+                background: #111827;
+                cursor: pointer;
+            }
+            .cw-video-play-overlay {
+                position: absolute;
+                inset: 0;
+                margin: auto;
+                width: 52px;
+                height: 52px;
+                border: none;
+                border-radius: 9999px;
+                background: rgba(255,255,255,0.92);
+                color: #111827;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+            }
+            .cw-video-play-overlay svg {
+                width: 22px;
+                height: 22px;
+                margin-left: 2px;
+            }
+            .cw-video-msg.is-playing .cw-video-play-overlay {
+                display: none;
+            }
+            .cw-ms-icon-btn.cw-recording {
+                color: #ef4444 !important;
+                animation: cw-pulse-record 1s ease-in-out infinite;
+            }
+            @keyframes cw-pulse-record {
+                0%, 100% { transform: scale(1); opacity: 1; }
+                50% { transform: scale(1.08); opacity: 0.85; }
+            }
+            .cw-voice-record-banner {
+                display: none;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                padding: 10px 12px;
+                margin: 0 0 8px;
+                border-radius: 10px;
+                background: #fef2f2;
+                color: #b91c1c;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .cw-voice-record-banner.is-active {
+                display: flex;
+            }
+            .cw-voice-record-banner-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 9999px;
+                background: #ef4444;
+                animation: cw-pulse-record 1s ease-in-out infinite;
+            }
+            .cw-voice-record-stop {
+                border: none;
+                border-radius: 8px;
+                background: #ef4444;
+                color: #fff;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 6px 10px;
+                cursor: pointer;
+            }
             .cw-ms-icon-btn.hidden {
                 display: none;
             }
@@ -3831,9 +4109,16 @@
                                 </div>
                             </div>
                         </div>
+                        <div id="cwVoiceRecordBanner" class="cw-voice-record-banner" role="status">
+                            <span class="inline-flex items-center gap-2">
+                                <span class="cw-voice-record-banner-dot" aria-hidden="true"></span>
+                                <span id="cwVoiceRecordBannerText">Recording voice message… 0:00</span>
+                            </span>
+                            <button type="button" class="cw-voice-record-stop" onclick="chatWidget.toggleVoiceRecording()">Stop &amp; send</button>
+                        </div>
                         <div class="cw-ms-composer">
                         <label for="chatInput" class="sr-only">Message</label>
-                        <div id="inputWrapper" class="pb-2 ps-2">
+                        <div id="inputWrapper" class="pb-2 px-2">
                             <textarea class="cw-ms-textarea" placeholder="Message…" id="chatInput" rows="1" onkeypress="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatWidget.sendMsg()}"></textarea>
                             <div class="cw-ms-toolbar">
                                 <div class="cw-ms-toolbar-group">
@@ -3848,7 +4133,7 @@
                                     <button type="button" id="cwComposerCallBtn" class="cw-ms-icon-btn hidden" title="Call agent" onclick="chatWidget.startVoiceCall()" aria-label="Call agent">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .3 2 .7 2.9a2 2 0 0 1-.5 2.1L8 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.5c.9.4 1.9.6 2.9.7A2 2 0 0 1 22 16.9Z"/></svg>
                                     </button>
-                                    <button type="button" class="cw-ms-icon-btn" title="Send voice message" aria-hidden="true" tabindex="-1" style="display:none">
+                                    <button type="button" id="cwComposerVoiceBtn" class="cw-ms-icon-btn" title="Record voice message" onclick="chatWidget.toggleVoiceRecording()" aria-label="Record voice message">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
                                     </button>
                                     <button type="button" class="cw-ms-send-btn" id="sendButton" onclick="chatWidget.sendMsg()" title="Send" aria-label="Send">
@@ -3922,7 +4207,7 @@
                             </button>
                         </div>
                         <div class="chat-widget-file-upload-body" id="fileUploadDropZone">
-                            <input type="file" id="fileUploadInput" class="hidden" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt" onchange="chatWidget.handleFileSelect(event)">
+                            <input type="file" id="fileUploadInput" class="hidden" accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.mp3,.wav,.ogg,.webm,.m4a,.mp4,.mov,.3gp" onchange="chatWidget.handleFileSelect(event)">
                             <div class="file-upload-placeholder" id="fileUploadPlaceholder">
                                 <svg viewBox="0 0 24 24" fill="none" class="w-16 h-16 stroke-[var(--text-color)] stroke-[1.5] opacity-40 mb-4">
                                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -4540,6 +4825,42 @@
         return '<svg viewBox="0 0 24 24" class="cw-msg-avatar-svg" aria-hidden="true"><path d="M12 12c2.8 0 5-2.2 5-5s-2.2-5-5-5-5 2.2-5 5 2.2 5 5 5zm0 2c-4.4 0-8 2.4-8 5.3V22h16v-2.7c0-2.9-3.6-5.3-8-5.3z" fill="rgba(0,0,0,0.35)"/></svg>';
     }
 
+    /** True when message has audio/video media — those only allow Reply (no Edit/Delete). */
+    function messageHasAudioOrVideoMedia(message) {
+        if (!message) return false;
+        if (extractCallAttachment(message)) return true;
+        var list = message.attachments;
+        if (!Array.isArray(list) || !list.length) return false;
+        for (var i = 0; i < list.length; i++) {
+            var raw = list[i];
+            var url = '';
+            var type = '';
+            var mime = '';
+            if (typeof raw === 'string') {
+                url = raw;
+            } else if (raw && typeof raw === 'object') {
+                if (String(raw.type || '') === 'call') return true;
+                url = String(raw.url || raw.path || '');
+                type = String(raw.type || '').toLowerCase();
+                mime = String(raw.mime_type || raw.mimeType || '').toLowerCase();
+            }
+            if (!url && !type && !mime) continue;
+            var urlLower = String(url).toLowerCase().split('?')[0];
+            var isWebm = /\.webm(\?|$)/i.test(urlLower) || mime.indexOf('webm') >= 0;
+            if (
+                type === 'audio' ||
+                type === 'video' ||
+                mime.indexOf('audio/') === 0 ||
+                mime.indexOf('video/') === 0 ||
+                isWebm ||
+                /\.(ogg|mp3|wav|m4a|aac|opus|mp4|mov|avi|mkv|wmv|flv|3gp|m4v)(\?|$)/i.test(urlLower)
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function buildMessageMenuHtml(menuId, messageId, options) {
         var mid = messageId != null ? String(messageId) : '';
         var o = options || {};
@@ -4571,6 +4892,109 @@
             '<div class="cw-message-menu-inner">' + items + '</div></div></div></div></div>';
     }
     
+    function extractCallAttachment(message) {
+        if (!message) return null;
+        if (message.call && typeof message.call === 'object') return message.call;
+        var list = message.attachments;
+        if (!Array.isArray(list)) return null;
+        for (var i = 0; i < list.length; i++) {
+            var item = list[i];
+            if (item && typeof item === 'object' && String(item.type || '') === 'call') {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    function formatCallLogDuration(seconds) {
+        var secs = Math.max(0, Math.floor(Number(seconds) || 0));
+        if (!secs) return '';
+        var mins = Math.floor(secs / 60);
+        var rem = secs % 60;
+        if (mins > 0) return mins + ' min ' + rem + ' sec';
+        return rem + ' sec';
+    }
+
+    function renderCallLogMessage(message) {
+        var call = extractCallAttachment(message);
+        if (!call) return null;
+
+        // API stores agent POV; visitor POV flips outgoing <-> incoming.
+        var agentDirection = String(call.direction || '').toLowerCase() === 'outgoing' ? 'outgoing' : 'incoming';
+        var visitorDirection = agentDirection === 'outgoing' ? 'incoming' : 'outgoing';
+        var status = String(call.call_status || call.status || 'completed').toLowerCase();
+        var media = String(call.media || 'voice').toLowerCase() === 'video' ? 'video call' : 'voice call';
+        var missedStatuses = { 'no-answer': 1, busy: 1, failed: 1, canceled: 1 };
+        var missed = visitorDirection === 'incoming' && !!missedStatuses[status];
+        var title = missed
+            ? ('Missed ' + media)
+            : (visitorDirection === 'outgoing' ? ('Outgoing ' + media) : ('Incoming ' + media));
+        var durationText = formatCallLogDuration(call.duration);
+        var subtitle = missed
+            ? 'You missed this call'
+            : (durationText || (visitorDirection === 'outgoing' ? 'Call ended' : 'Call answered'));
+
+        var isMe = visitorDirection === 'outgoing';
+        var timeLabel = typeof formatMessageClock === 'function'
+            ? formatMessageClock(message.created_at)
+            : '';
+        var timeTitle = escapeHtml(String(message.created_at || ''));
+
+        var wrap = document.createElement('div');
+        wrap.className = 'cw-msg-wrap w-full max-w-full animate-fade-in';
+        if (message && message.id != null) {
+            wrap.setAttribute('data-message-id', String(message.id));
+        }
+
+        var arrowPath = visitorDirection === 'outgoing'
+            ? '<path d="M15 4h5v5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+            : '<path d="M20 4l-5 5m0-4v4h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>';
+
+        var bubbleHtml =
+            '<div class="cw-call-log-bubble ' + (isMe ? 'cw-call-me' : 'cw-call-them') + '">' +
+                '<div class="cw-call-log-row">' +
+                    '<span class="cw-call-log-glyph' + (missed ? ' cw-call-missed' : '') + '" aria-hidden="true">' +
+                        '<svg viewBox="0 0 24 24" fill="none">' +
+                            '<path d="M6.62 10.79a15.05 15.05 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24 11.4 11.4 0 0 0 3.57.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1 11.4 11.4 0 0 0 .57 3.57 1 1 0 0 1-.24 1.02l-2.21 2.2Z" fill="currentColor"/>' +
+                            arrowPath +
+                        '</svg>' +
+                    '</span>' +
+                    '<div style="min-width:0;flex:1">' +
+                        '<p class="cw-call-log-title">' + escapeHtml(title) + '</p>' +
+                        '<p class="cw-call-log-sub">' + escapeHtml(subtitle) + '</p>' +
+                    '</div>' +
+                '</div>' +
+                (timeLabel
+                    ? ('<span class="cw-call-log-time" title="' + timeTitle + '">' + escapeHtml(timeLabel) + '</span>')
+                    : '') +
+            '</div>';
+
+        if (isMe) {
+            wrap.innerHTML =
+                '<div class="cw-msg-row cw-outbound">' +
+                    '<div class="cw-msg-col cw-outbound">' +
+                        '<div class="cw-msg-stack">' +
+                            '<div class="cw-msg-bubble-group cw-out-group group">' + bubbleHtml + '</div>' +
+                        '</div>' +
+                    '</div>' +
+                '</div>';
+        } else {
+            wrap.innerHTML =
+                '<div class="cw-msg-row cw-inbound">' +
+                    '<div class="cw-msg-avatar shrink-0 mt-auto" aria-hidden="true">' +
+                        (typeof buildInboundAvatarHtml === 'function' ? buildInboundAvatarHtml() : '') +
+                    '</div>' +
+                    '<div class="cw-msg-col cw-inbound">' +
+                        '<div class="cw-msg-stack">' +
+                            '<div class="cw-msg-bubble-group cw-in-group group">' + bubbleHtml + '</div>' +
+                        '</div>' +
+                    '</div>' +
+                '</div>';
+        }
+
+        return wrap;
+    }
+
     function renderMessage(message) {
         var dir0 = message && message.direction ? String(message.direction).toLowerCase() : '';
         var isTimeline =
@@ -4589,6 +5013,11 @@
             sysPill.textContent = String((message && message.message) || '').trim();
             sysWrap.appendChild(sysPill);
             return sysWrap;
+        }
+
+        if (extractCallAttachment(message)) {
+            var callEl = renderCallLogMessage(message);
+            if (callEl) return callEl;
         }
 
         const isInbound = (function () {
@@ -4677,41 +5106,136 @@
             return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
         }
         
-        // Helper function to render a single attachment
-        function renderAttachment(fileUrl) {
-            // Check if it's an image type (png, jpg, jpeg, svg, webp)
-            const imageExtensions = ['png', 'jpg', 'jpeg', 'svg', 'webp'];
-            const urlLower = fileUrl.toLowerCase();
-            const isImageType = imageExtensions.some(ext => urlLower.endsWith('.' + ext));
-            
-            if (isImageType) {
-                // Image attachments - show image preview with transparent background
-                return `<div class="mb-2"><img src="${escapeHtml(fileUrl)}" alt="Attachment" class="max-w-full h-auto rounded-lg cursor-pointer" onclick="window.open('${escapeHtml(fileUrl)}', '_blank')" style="max-height: 200px; object-fit: contain; background: transparent;"></div>`;
-            } else {
-                // Non-image attachments - use document design from chat-widget.html
-                const fileName = fileUrl.split('/').pop() || 'Attachment';
-                
-                return `<div class="flex items-center gap-2.5 px-3 py-2.5 rounded-lg cursor-pointer transition-colors duration-200 max-w-[250px] mb-2" style="background-color: #e5e7eb;" onclick="window.open('${escapeHtml(fileUrl)}', '_blank')">
-                    <div class="w-8 h-8 flex-shrink-0 flex items-center justify-center rounded-md" style="background-color: #d1d5db;">
-                        <svg viewBox="0 0 24 24" fill="none" class="w-[18px] h-[18px] stroke-[#666] stroke-[2] fill-none">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6Z"/>
-                            <path d="M14 2v6h6"/>
-                            <path d="M16 13H8"/>
-                            <path d="M16 17H8"/>
-                            <path d="M10 9H8"/>
-                        </svg>
-                    </div>
-                    <div class="flex-1 min-w-0">
-                        <div class="text-[13px] font-medium text-[var(--text-color)] m-0 mb-0.5 overflow-hidden text-ellipsis whitespace-nowrap">${escapeHtml(fileName)}</div>
-                    </div>
-                </div>`;
+        function normalizeAttachmentDescriptor(raw) {
+            if (!raw) return null;
+            if (typeof raw === 'string') {
+                return { url: raw, type: '', mime_type: '', filename: raw.split('/').pop() || 'Attachment' };
             }
+            if (typeof raw === 'object') {
+                var url = raw.url || raw.path || '';
+                if (!url) return null;
+                return {
+                    url: String(url),
+                    type: String(raw.type || ''),
+                    mime_type: String(raw.mime_type || raw.mimeType || ''),
+                    filename: String(raw.filename || raw.name || (String(url).split('/').pop() || 'Attachment')),
+                    duration: raw.duration
+                };
+            }
+            return null;
+        }
+
+        function classifyAttachment(desc) {
+            var urlLower = String(desc.url || '').toLowerCase().split('?')[0];
+            var type = String(desc.type || '').toLowerCase();
+            var mime = String(desc.mime_type || '').toLowerCase();
+            var isWebm = /\.webm(\?|$)/i.test(urlLower) || mime.indexOf('webm') >= 0;
+            // Chat voice notes are almost always webm from MediaRecorder (often mislabeled video/webm).
+            var isAudio =
+                type === 'audio' ||
+                mime.indexOf('audio/') === 0 ||
+                isWebm ||
+                /\.(ogg|mp3|wav|m4a|aac|opus)(\?|$)/i.test(urlLower);
+            var isVideo = !isAudio && (
+                type === 'video' ||
+                mime.indexOf('video/') === 0 ||
+                /\.(mp4|mov|avi|mkv|wmv|flv|3gp|m4v)(\?|$)/i.test(urlLower)
+            );
+            var isImage = type === 'image' || mime.indexOf('image/') === 0 ||
+                /\.(png|jpe?g|gif|svg|webp|bmp)(\?|$)/i.test(urlLower);
+            return { isVideo: isVideo, isAudio: isAudio, isImage: isImage };
+        }
+
+        function seedWaveform(seed, bars) {
+            var count = bars || 28;
+            var out = [];
+            var h = 2166136261;
+            var s = String(seed || 'voice');
+            for (var i = 0; i < s.length; i++) {
+                h ^= s.charCodeAt(i);
+                h = Math.imul(h, 16777619);
+            }
+            for (var b = 0; b < count; b++) {
+                h ^= b + 1;
+                h = Math.imul(h, 16777619);
+                var n = ((h >>> 0) % 70) / 100;
+                out.push(0.22 + n);
+            }
+            return out;
+        }
+
+        // Helper function to render a single attachment (WhatsApp/Nilaq-style voice/video/image/doc)
+        function renderAttachment(raw, opts) {
+            var desc = normalizeAttachmentDescriptor(raw);
+            if (!desc) return '';
+            var kind = classifyAttachment(desc);
+            var fileUrl = desc.url;
+            var safeUrl = escapeHtml(fileUrl);
+            var fileName = escapeHtml(desc.filename || 'Attachment');
+            var isMine = !!(opts && opts.isMe);
+
+            if (kind.isAudio) {
+                var bars = seedWaveform(fileUrl, 34).map(function (h, idx) {
+                    return '<span class="cw-voice-bar" style="height:' + Math.round(h * 100) + '%" data-i="' + idx + '"></span>';
+                }).join('');
+                return (
+                    '<div class="cw-voice-msg mb-2 ' + (isMine ? 'cw-voice-me' : 'cw-voice-them') + '" data-audio-url="' + safeUrl + '">' +
+                        '<button type="button" class="cw-voice-play" aria-label="Play voice message" onclick="chatWidget.toggleVoiceMessage(this)">' +
+                            '<svg class="cw-voice-play-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 0 0 1.54.84l10.29-6.86a1 1 0 0 0 0-1.68L9.54 4.3A1 1 0 0 0 8 5.14Z"/></svg>' +
+                            '<svg class="cw-voice-pause-icon hidden" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>' +
+                        '</button>' +
+                        '<div class="cw-voice-wave" onpointerdown="chatWidget.seekVoiceMessage(event, this)">' +
+                            bars +
+                            '<span class="cw-voice-knob" aria-hidden="true"></span>' +
+                        '</div>' +
+                        '<span class="cw-voice-dur">0:00</span>' +
+                        '<span class="cw-voice-mic" aria-hidden="true">' +
+                            '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 11a7 7 0 0 1-14 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 18v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' +
+                        '</span>' +
+                    '</div>'
+                );
+            }
+
+            if (kind.isVideo) {
+                return (
+                    '<div class="cw-video-msg mb-2">' +
+                        '<video class="cw-video-el" src="' + safeUrl + '" playsinline preload="metadata" ' +
+                            'onclick="chatWidget.toggleVideoMessage(this)" ' +
+                            'controlsList="nodownload"></video>' +
+                        '<button type="button" class="cw-video-play-overlay" aria-label="Play video" onclick="chatWidget.toggleVideoMessage(this.previousElementSibling)">' +
+                            '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>' +
+                        '</button>' +
+                    '</div>'
+                );
+            }
+
+            if (kind.isImage) {
+                return '<div class="mb-2"><img src="' + safeUrl + '" alt="Attachment" class="max-w-full h-auto rounded-lg cursor-pointer" onclick="window.open(\'' + safeUrl + '\', \'_blank\')" style="max-height: 200px; object-fit: contain; background: transparent;"></div>';
+            }
+
+            return '<div class="flex items-center gap-2.5 px-3 py-2.5 rounded-lg cursor-pointer transition-colors duration-200 max-w-[250px] mb-2" style="background-color: #e5e7eb;" onclick="window.open(\'' + safeUrl + '\', \'_blank\')">' +
+                '<div class="w-8 h-8 flex-shrink-0 flex items-center justify-center rounded-md" style="background-color: #d1d5db;">' +
+                    '<svg viewBox="0 0 24 24" fill="none" class="w-[18px] h-[18px] stroke-[#666] stroke-[2] fill-none">' +
+                        '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6Z"/>' +
+                        '<path d="M14 2v6h6"/>' +
+                        '<path d="M16 13H8"/>' +
+                        '<path d="M16 17H8"/>' +
+                        '<path d="M10 9H8"/>' +
+                    '</svg>' +
+                '</div>' +
+                '<div class="flex-1 min-w-0">' +
+                    '<div class="text-[13px] font-medium text-[var(--text-color)] m-0 mb-0.5 overflow-hidden text-ellipsis whitespace-nowrap">' + fileName + '</div>' +
+                '</div>' +
+            '</div>';
         }
         
         // Process all attachments
         if (attachments.length > 0) {
-            // Render all attachments
-            attachmentContent = attachments.map(url => renderAttachment(url)).join('');
+            // Visitor "outbound" = theirs (me); agent "inbound" = them.
+            var voiceIsMine = !isInbound;
+            attachmentContent = attachments.map(function (item) {
+                return renderAttachment(item, { isMe: voiceIsMine });
+            }).join('');
             
             // Add message text if it exists and is not a standalone file URL
             if (message.message && !isStandaloneFileAttachment) {
@@ -4867,7 +5391,14 @@
                     '<span class="cw-bubble-meta"><span class="cw-time cw-bubble-footer" title="' + outTitle + '">' + escapeHtml(outClock) + '</span>' +
                     '<span data-outbound-ticks="1">' + tickHtml + '</span></span></div></div>')
                 : '';
-            var outMenuHtml = buildMessageMenuHtml(outMenuId, midStrOut, { edit: true, reply: true, delete: true, placement: 'right', order: 1 });
+            var allowEditDelete = !messageHasAudioOrVideoMedia(message);
+            var outMenuHtml = buildMessageMenuHtml(outMenuId, midStrOut, {
+                edit: allowEditDelete,
+                reply: true,
+                delete: allowEditDelete,
+                placement: 'right',
+                order: 1
+            });
             messageDiv.innerHTML = `
                 <div class="cw-msg-row cw-outbound">
                     <div class="cw-msg-col cw-outbound">
@@ -6603,6 +7134,333 @@
             void startVisitorOutboundCall();
         },
 
+        _activeVoiceAudio: null,
+        _voiceRecorder: null,
+        _voiceChunks: null,
+        _voiceStream: null,
+        _voiceRecording: false,
+        _voiceRecordTimerId: null,
+        _voiceRecordStartedAt: null,
+
+        _setVoiceRecordBanner: function (active, elapsedSec) {
+            var banner = document.getElementById('cwVoiceRecordBanner');
+            var textEl = document.getElementById('cwVoiceRecordBannerText');
+            if (!banner) return;
+            if (active) {
+                banner.classList.add('is-active');
+                var secs = Math.max(0, Math.floor(elapsedSec || 0));
+                var mins = Math.floor(secs / 60);
+                var rem = secs % 60;
+                if (textEl) {
+                    textEl.textContent = 'Recording voice message… ' + mins + ':' + String(rem).padStart(2, '0');
+                }
+            } else {
+                banner.classList.remove('is-active');
+                if (textEl) textEl.textContent = 'Recording voice message… 0:00';
+            }
+        },
+
+        _updateVoiceProgressUi: function (wrap, audio) {
+            if (!wrap || !audio) return;
+            var durEl = wrap.querySelector('.cw-voice-dur');
+            var knob = wrap.querySelector('.cw-voice-knob');
+            var bars = wrap.querySelectorAll('.cw-voice-bar');
+            var duration = audio.duration && isFinite(audio.duration) ? audio.duration : 0;
+            var current = audio.currentTime || 0;
+            var progress = duration > 0 ? Math.min(1, current / duration) : 0;
+            var showTime = (!audio.paused || current > 0) ? current : duration;
+            if (durEl) {
+                var t = Math.floor(showTime || 0);
+                durEl.textContent = Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
+            }
+            if (knob) knob.style.left = (progress * 100) + '%';
+            if (bars && bars.length) {
+                for (var i = 0; i < bars.length; i++) {
+                    if ((i / bars.length) <= progress) bars[i].classList.add('is-played');
+                    else bars[i].classList.remove('is-played');
+                }
+            }
+        },
+
+        seekVoiceMessage: function (event, waveEl) {
+            try {
+                if (!waveEl) return;
+                var wrap = waveEl.closest ? waveEl.closest('.cw-voice-msg') : null;
+                if (!wrap) return;
+                var audio = this._activeVoiceAudio;
+                if (!audio || audio._wrap !== wrap) {
+                    // Start this clip paused at the seek point, then play.
+                    var playBtn = wrap.querySelector('.cw-voice-play');
+                    if (playBtn) this.toggleVoiceMessage(playBtn);
+                    audio = this._activeVoiceAudio;
+                }
+                if (!audio || !audio.duration || !isFinite(audio.duration)) return;
+                var rect = waveEl.getBoundingClientRect();
+                var ratio = Math.min(1, Math.max(0, ((event.clientX || 0) - rect.left) / Math.max(1, rect.width)));
+                audio.currentTime = ratio * audio.duration;
+                this._updateVoiceProgressUi(wrap, audio);
+            } catch (e) {
+                cwError('seekVoiceMessage failed', e);
+            }
+        },
+
+        toggleVoiceMessage: function (btn) {
+            try {
+                var wrap = btn && btn.closest ? btn.closest('.cw-voice-msg') : null;
+                if (!wrap) return;
+                var url = wrap.getAttribute('data-audio-url');
+                if (!url) return;
+                var playIcon = btn.querySelector('.cw-voice-play-icon');
+                var pauseIcon = btn.querySelector('.cw-voice-pause-icon');
+                var self = this;
+
+                if (this._activeVoiceAudio && this._activeVoiceAudio._wrap === wrap && !this._activeVoiceAudio.paused) {
+                    this._activeVoiceAudio.pause();
+                    wrap.classList.remove('is-playing');
+                    if (playIcon) playIcon.classList.remove('hidden');
+                    if (pauseIcon) pauseIcon.classList.add('hidden');
+                    return;
+                }
+
+                if (this._activeVoiceAudio) {
+                    try {
+                        this._activeVoiceAudio.pause();
+                        if (this._activeVoiceAudio._wrap) {
+                            this._activeVoiceAudio._wrap.classList.remove('is-playing');
+                            var prevBtn = this._activeVoiceAudio._wrap.querySelector('.cw-voice-play');
+                            if (prevBtn) {
+                                var pPlay = prevBtn.querySelector('.cw-voice-play-icon');
+                                var pPause = prevBtn.querySelector('.cw-voice-pause-icon');
+                                if (pPlay) pPlay.classList.remove('hidden');
+                                if (pPause) pPause.classList.add('hidden');
+                            }
+                            self._updateVoiceProgressUi(this._activeVoiceAudio._wrap, this._activeVoiceAudio);
+                        }
+                    } catch (eStop) {}
+                }
+
+                var audio = new Audio(url);
+                audio._wrap = wrap;
+                this._activeVoiceAudio = audio;
+                wrap.classList.add('is-playing');
+                if (playIcon) playIcon.classList.add('hidden');
+                if (pauseIcon) pauseIcon.classList.remove('hidden');
+
+                audio.ontimeupdate = function () {
+                    self._updateVoiceProgressUi(wrap, audio);
+                };
+                audio.onloadedmetadata = function () {
+                    self._updateVoiceProgressUi(wrap, audio);
+                };
+                audio.onended = function () {
+                    wrap.classList.remove('is-playing');
+                    if (playIcon) playIcon.classList.remove('hidden');
+                    if (pauseIcon) pauseIcon.classList.add('hidden');
+                    audio.currentTime = 0;
+                    self._updateVoiceProgressUi(wrap, audio);
+                };
+                void audio.play().catch(function () {
+                    wrap.classList.remove('is-playing');
+                    if (playIcon) playIcon.classList.remove('hidden');
+                    if (pauseIcon) pauseIcon.classList.add('hidden');
+                    notifyUser('Could not play this voice message.');
+                });
+            } catch (e) {
+                cwError('toggleVoiceMessage failed', e);
+            }
+        },
+
+        toggleVideoMessage: function (videoEl) {
+            try {
+                if (!videoEl || videoEl.tagName !== 'VIDEO') return;
+                var wrap = videoEl.closest ? videoEl.closest('.cw-video-msg') : null;
+                if (videoEl.paused) {
+                    void videoEl.play().then(function () {
+                        if (wrap) wrap.classList.add('is-playing');
+                    }).catch(function () {
+                        notifyUser('Could not play this video.');
+                    });
+                } else {
+                    videoEl.pause();
+                    if (wrap) wrap.classList.remove('is-playing');
+                }
+                videoEl.onended = function () {
+                    if (wrap) wrap.classList.remove('is-playing');
+                };
+            } catch (e) {
+                cwError('toggleVideoMessage failed', e);
+            }
+        },
+
+        toggleVoiceRecording: async function () {
+            var btn = document.getElementById('cwComposerVoiceBtn');
+            var self = this;
+            try {
+                if (this._voiceRecording) {
+                    if (this._voiceRecorder && this._voiceRecorder.state !== 'inactive') {
+                        this._voiceRecorder.stop();
+                    }
+                    return;
+                }
+
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    notifyUser('Voice recording is not supported in this browser.');
+                    return;
+                }
+                if (typeof MediaRecorder === 'undefined') {
+                    notifyUser('Voice recording is not supported in this browser.');
+                    return;
+                }
+
+                var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                this._voiceStream = stream;
+                this._voiceChunks = [];
+                var mimeType = '';
+                if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                    mimeType = 'audio/webm;codecs=opus';
+                } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                    mimeType = 'audio/webm';
+                } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+                    mimeType = 'audio/ogg';
+                }
+                var recorder = mimeType
+                    ? new MediaRecorder(stream, { mimeType: mimeType })
+                    : new MediaRecorder(stream);
+                this._voiceRecorder = recorder;
+                this._voiceRecording = true;
+                this._voiceRecordStartedAt = Date.now();
+                this._setVoiceRecordBanner(true, 0);
+                if (this._voiceRecordTimerId) {
+                    clearInterval(this._voiceRecordTimerId);
+                }
+                this._voiceRecordTimerId = setInterval(function () {
+                    if (!self._voiceRecordStartedAt) return;
+                    self._setVoiceRecordBanner(true, (Date.now() - self._voiceRecordStartedAt) / 1000);
+                }, 250);
+                if (btn) {
+                    btn.classList.add('cw-recording');
+                    btn.title = 'Stop & send voice message';
+                }
+
+                recorder.ondataavailable = function (ev) {
+                    if (ev.data && ev.data.size > 0) {
+                        self._voiceChunks.push(ev.data);
+                    }
+                };
+                recorder.onstop = function () {
+                    self._voiceRecording = false;
+                    if (self._voiceRecordTimerId) {
+                        clearInterval(self._voiceRecordTimerId);
+                        self._voiceRecordTimerId = null;
+                    }
+                    self._voiceRecordStartedAt = null;
+                    self._setVoiceRecordBanner(false, 0);
+                    if (btn) {
+                        btn.classList.remove('cw-recording');
+                        btn.title = 'Record voice message';
+                    }
+                    try {
+                        if (self._voiceStream) {
+                            self._voiceStream.getTracks().forEach(function (t) { t.stop(); });
+                        }
+                    } catch (eTracks) {}
+                    self._voiceStream = null;
+
+                    // Always coerce to an audio MIME — some browsers emit video/webm for mic-only recordings.
+                    var rawType = String(recorder.mimeType || mimeType || 'audio/webm').split(';')[0].toLowerCase();
+                    var blobType = rawType.indexOf('ogg') >= 0 ? 'audio/ogg' : 'audio/webm';
+                    var ext = blobType.indexOf('ogg') >= 0 ? 'ogg' : 'webm';
+                    var blob = new Blob(self._voiceChunks || [], { type: blobType });
+                    self._voiceChunks = null;
+                    self._voiceRecorder = null;
+                    if (!blob.size) {
+                        notifyUser('Recording was empty. Please try again.');
+                        return;
+                    }
+                    var file = new File([blob], 'voice-' + Date.now() + '.' + ext, { type: blobType });
+                    void self.uploadAndSendVoiceNote(file);
+                };
+                recorder.start();
+            } catch (e) {
+                this._voiceRecording = false;
+                if (this._voiceRecordTimerId) {
+                    clearInterval(this._voiceRecordTimerId);
+                    this._voiceRecordTimerId = null;
+                }
+                this._voiceRecordStartedAt = null;
+                this._setVoiceRecordBanner(false, 0);
+                if (btn) {
+                    btn.classList.remove('cw-recording');
+                    btn.title = 'Record voice message';
+                }
+                cwError('toggleVoiceRecording failed', e);
+                notifyUser('Could not access microphone. Please allow mic permission and try again.');
+            }
+        },
+
+        uploadAndSendVoiceNote: async function (file) {
+            try {
+                notifyUser('Sending voice message…');
+                var session = await initializeChatSession(false);
+                if (!session) throw new Error('No session');
+                var formData = new FormData();
+                formData.append('file', file);
+                var uploadUrl = getUploadApiUrl(session.visitor_id);
+                var response = await fetch(uploadUrl, {
+                    method: 'POST',
+                    headers: (function () {
+                        var h = {};
+                        if (session.token) h.Authorization = 'Bearer ' + session.token;
+                        else if (session.session_key) h['X-Session-Key'] = session.session_key;
+                        return h;
+                    })(),
+                    body: formData
+                });
+                if (response.status === 401) {
+                    session = await initializeChatSession(true);
+                    if (!session) throw new Error('No session');
+                    response = await fetch(uploadUrl, {
+                        method: 'POST',
+                        headers: (function () {
+                            var h = {};
+                            if (session.token) h.Authorization = 'Bearer ' + session.token;
+                            else if (session.session_key) h['X-Session-Key'] = session.session_key;
+                            return h;
+                        })(),
+                        body: (function () {
+                            var fd = new FormData();
+                            fd.append('file', file);
+                            return fd;
+                        })()
+                    });
+                }
+                if (!response.ok) throw new Error('Upload failed');
+                var data = await response.json();
+                if (!data || !data.success || !data.path) throw new Error('Upload failed');
+                var fileId = 'voice_' + Date.now();
+                var attachments = {};
+                var forcedMime = (file && file.type && String(file.type).indexOf('audio/') === 0)
+                    ? file.type
+                    : 'audio/webm';
+                attachments[fileId] = {
+                    path: data.path,
+                    type: 'audio',
+                    mime_type: forcedMime,
+                    filename: data.filename || file.name || ('voice-' + Date.now() + '.webm')
+                };
+                await sendMessageToAPI('', {}, attachments);
+                var messagesData = await fetchMessages();
+                if (messagesData && Array.isArray(messagesData.messages)) {
+                    widgetState.messages = messagesData.messages;
+                    widgetState.messagesLoaded = true;
+                    displayMessages(messagesData.messages);
+                }
+            } catch (e) {
+                cwError('uploadAndSendVoiceNote failed', e);
+                notifyUser('Failed to send voice message. Please try again.');
+            }
+        },
+
         toggleMessageMenu: function (event, menuId) {
             try {
                 ensureMessageMenuCloseHandlerInstalled();
@@ -6655,6 +7513,8 @@
             if (!sel) return;
             var msg = getMessageFromStateByWidgetId(sel);
             if (!msg || isInboundMessageObj(msg)) return;
+            // Audio/video media: Reply only — never edit.
+            if (messageHasAudioOrVideoMedia(msg)) return;
             widgetState.editingMessageNumber = String(sel);
             var inp = document.getElementById('chatInput');
             if (inp) {
@@ -6679,6 +7539,8 @@
             if (!sel) return;
             var msg = getMessageFromStateByWidgetId(sel);
             if (!msg || isInboundMessageObj(msg)) return;
+            // Audio/video media: Reply only — never delete.
+            if (messageHasAudioOrVideoMedia(msg)) return;
             if (!window.confirm('Delete this message?')) return;
             try {
                 await deleteVisitorMessageApi(String(sel));
@@ -6710,11 +7572,15 @@
                 return;
             }
             if (type === 'edit') {
+                var editMsg = getMessageFromStateByWidgetId(s);
+                if (editMsg && messageHasAudioOrVideoMedia(editMsg)) return;
                 widgetState.selectedMessageId = s;
                 this.footerActionEdit();
                 return;
             }
             if (type === 'delete') {
+                var delMsg = getMessageFromStateByWidgetId(s);
+                if (delMsg && messageHasAudioOrVideoMedia(delMsg)) return;
                 widgetState.selectedMessageId = s;
                 void this.footerActionDelete();
             }
@@ -7021,9 +7887,9 @@
                 if (files.length > 0) {
                     const file = files[0];
                     // Validate file
-                    const maxSize = 5 * 1024 * 1024;
+                    const maxSize = 25 * 1024 * 1024;
                     if (file.size > maxSize) {
-                        notifyUser('File size exceeds 5MB limit. Please choose a smaller file.');
+                        notifyUser('File size exceeds 25MB limit. Please choose a smaller file.');
                         return;
                     }
                     // Create a FileList-like object
@@ -7047,31 +7913,38 @@
             }
             if (!file) return;
             
-            // Validate file size (5MB = 5242880 bytes)
-            const maxSize = 5 * 1024 * 1024;
+            // Validate file size (25MB for audio/video)
+            const maxSize = 25 * 1024 * 1024;
             if (file.size > maxSize) {
-                notifyUser('File size exceeds 5MB limit. Please choose a smaller file.');
+                notifyUser('File size exceeds 25MB limit. Please choose a smaller file.');
                 return;
             }
             
             // Validate file type - check by extension first, then MIME type
-            const allowedExtensions = /\.(jpg|jpeg|png|gif|webp|svg|bmp|pdf|doc|docx|xls|xlsx|txt)$/i;
+            const allowedExtensions = /\.(jpg|jpeg|png|gif|webp|svg|bmp|pdf|doc|docx|xls|xlsx|txt|mp3|wav|ogg|webm|m4a|aac|mp4|mov|3gp|m4v)$/i;
             const allowedMimeTypes = [
                 'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml', 'image/bmp',
                 'application/pdf',
                 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                'text/plain'
+                'text/plain',
+                'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/webm', 'audio/mp4', 'audio/m4a', 'audio/aac',
+                'video/mp4', 'video/webm', 'video/quicktime', 'video/3gpp'
             ];
             
             // Check by extension first (more reliable for some browsers)
             const hasValidExtension = allowedExtensions.test(file.name);
             // Check by MIME type (some files may have empty or incorrect MIME types)
-            const hasValidMimeType = file.type && allowedMimeTypes.includes(file.type);
+            const hasValidMimeType = file.type && (
+                allowedMimeTypes.includes(file.type) ||
+                file.type.indexOf('audio/') === 0 ||
+                file.type.indexOf('video/') === 0 ||
+                file.type.indexOf('image/') === 0
+            );
             
             // Allow if either extension or MIME type is valid
             if (!hasValidExtension && !hasValidMimeType) {
-                notifyUser('File type not supported. Please upload images, PDF, documents, or text files.');
+                notifyUser('File type not supported. Please upload images, audio, video, PDF, or documents.');
                 return;
             }
             
@@ -7487,9 +8360,18 @@
                 // Generate file ID
                 const fileId = 'file_' + Date.now();
                 
-                // Prepare attachments payload with path
+                // Prepare typed attachments so inbox/widget can render voice/video players
                 const attachments = {};
-                attachments[fileId] = this.uploadedFile.response.path;
+                const uploadResp = this.uploadedFile.response;
+                const uploadFile = this.uploadedFile.file;
+                attachments[fileId] = {
+                    path: uploadResp.path,
+                    type: uploadResp.type || (uploadFile && uploadFile.type && uploadFile.type.indexOf('video/') === 0
+                        ? 'video'
+                        : (uploadFile && uploadFile.type && uploadFile.type.indexOf('audio/') === 0 ? 'audio' : undefined)),
+                    mime_type: uploadResp.mime_type || (uploadFile ? uploadFile.type : null),
+                    filename: uploadResp.filename || (uploadFile ? uploadFile.name : null)
+                };
                 
                 // Send message with attachment (empty message text) — never block; retry silently on throttling/network.
                 const trySend = async (attempt) => {
