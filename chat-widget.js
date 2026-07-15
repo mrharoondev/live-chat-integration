@@ -62,6 +62,24 @@
             // Single-session: allow identity history. Multiple: latest/active thread only.
             u.searchParams.set('all', '1');
         }
+        // Always scope to the open thread when known. Multiple-chat policy previously only
+        // used selectedConversationNumber, so agent replies on conversationNumber never
+        // appeared (API could resolve a different contact history thread).
+        var convNum = opts.conversationNumber
+            || widgetState.selectedConversationNumber
+            || widgetState.conversationNumber
+            || null;
+        if (convNum) {
+            u.searchParams.set('conversation_number', String(convNum));
+        }
+        return u.toString();
+    }
+
+    function getConversationsApiUrl(visitorId) {
+        const config = getApiConfig();
+        const channelId = config.channelId || getChannelId();
+        const u = new URL(`${config.apiDomain}${config.apiBasePath}/${channelId}/conversations`);
+        if (visitorId) u.searchParams.set('visitor_id', String(visitorId));
         return u.toString();
     }
 
@@ -261,10 +279,13 @@
     let widgetState = {
         messages: null,
         conversationNumber: null,
+        selectedConversationNumber: null,
         formRequired: null,
         widgetSettings: null,
         visitorChatPolicy: 'single',
         currentScreen: null,
+        messagesPane: null,
+        conversations: [],
         messagesLoaded: false,
         attachments: {}, // Store uploaded attachments: { fileId: path }
         assignedAgent: null,
@@ -274,7 +295,8 @@
         pendingInReplyOf: null,
         editingMessageNumber: null,
         conversationStatus: null,
-        canReply: true
+        canReply: true,
+        canStartNewChat: false
     };
     
     // Reset state on page load (for fresh load)
@@ -282,10 +304,13 @@
         widgetState = {
             messages: null,
             conversationNumber: null,
+            selectedConversationNumber: null,
             formRequired: null,
             widgetSettings: null,
             visitorChatPolicy: 'single',
             currentScreen: null,
+            messagesPane: null,
+            conversations: [],
             messagesLoaded: false,
             attachments: {},
             assignedAgent: null,
@@ -295,7 +320,8 @@
             pendingInReplyOf: null,
             editingMessageNumber: null,
             conversationStatus: null,
-            canReply: true
+            canReply: true,
+            canStartNewChat: false
         };
     }
     
@@ -650,8 +676,26 @@
                 if (!data || String(data.conversation_number) !== String(conv)) {
                     return;
                 }
-                fetchMessages().then(function(messagesData) {
-                    applyRealtimeMessageListUpdate(messagesData, conv);
+                if (data.is_private) {
+                    return;
+                }
+                // Show agent text immediately from the websocket payload so the visitor
+                // does not wait on the follow-up REST fetch (or a failed auth poll).
+                try {
+                    appendOptimisticAgentMessageFromRealtime(data);
+                } catch (optErr) {
+                    cwWarn('ChatWidget: optimistic agent message failed', optErr);
+                }
+                fetchMessages(conv).then(function(messagesData) {
+                    try {
+                        applyRealtimeMessageListUpdate(messagesData, conv);
+                    } catch (applyErr) {
+                        cwError('ChatWidget: realtime message apply failed', applyErr);
+                        // Fallback: full redraw so agent replies still appear.
+                        var list = (messagesData && messagesData.messages) || [];
+                        widgetState.messages = list;
+                        if (list.length) displayMessages(list);
+                    }
                 }).catch(function() {});
             });
             ch.bind('message-status-updated', function(data) {
@@ -674,7 +718,7 @@
                     return;
                 }
                 void fetchAgentMetaOnce();
-                fetchMessages().then(function(messagesData) {
+                fetchMessages(conv).then(function(messagesData) {
                     applyRealtimeMessageListUpdate(messagesData, conv);
                 }).catch(function() {});
             });
@@ -683,6 +727,10 @@
                 widgetState.conversationStatus = data.status || null;
                 if (widgetState.visitorChatPolicy === 'multiple' && data.status === 'closed') {
                     widgetState.canReply = false;
+                    if (widgetState.currentScreen === 'messages' && widgetState.messagesPane === 'conversation') {
+                        showChatClosedConfirmation();
+                        return;
+                    }
                 } else if (data.status === 'open' || data.status === 'pending') {
                     widgetState.canReply = true;
                 }
@@ -947,6 +995,9 @@
             if (data.visitor_chat_policy) {
                 widgetState.visitorChatPolicy = data.visitor_chat_policy;
             }
+            if (Object.prototype.hasOwnProperty.call(data, 'can_start_new_chat')) {
+                widgetState.canStartNewChat = data.can_start_new_chat === true;
+            }
             if (Object.prototype.hasOwnProperty.call(data, 'conversation_number')) {
                 widgetState.conversationNumber = data.conversation_number || null;
                 if (!data.conversation_number) {
@@ -1124,7 +1175,6 @@
     function syncComposerClosedState() {
         var input = document.getElementById('chatInput');
         var sendBtn = document.getElementById('sendButton');
-        var banner = document.getElementById('cwConversationClosedBanner');
         var allowed = isConversationReplyAllowed();
         if (input) {
             input.disabled = !allowed;
@@ -1132,13 +1182,37 @@
             else if (typeof syncChatInputPlaceholder === 'function') syncChatInputPlaceholder();
         }
         if (sendBtn && !allowed) sendBtn.disabled = true;
-        if (banner) banner.style.display = allowed ? 'none' : 'block';
         var attachBtn = document.getElementById('cwComposerAttachBtn');
         var voiceBtn = document.getElementById('cwComposerVoiceBtn');
         var callBtn = document.getElementById('cwComposerCallBtn');
         if (attachBtn) attachBtn.disabled = !allowed || !isMediaUploadEnabled();
         if (voiceBtn) voiceBtn.disabled = !allowed || !isVoiceMessageEnabled();
         if (callBtn && !allowed) callBtn.disabled = true;
+
+        // Multiple-chat: when the open thread is closed, show the confirmation screen.
+        if (
+            isMultipleChatPolicy() &&
+            !allowed &&
+            widgetState.currentScreen === 'messages' &&
+            (widgetState.messagesPane === 'conversation' || widgetState.messagesPane === 'closed')
+        ) {
+            showChatClosedConfirmation();
+        }
+    }
+
+    function showChatClosedConfirmation() {
+        widgetState.messagesPane = 'closed';
+        widgetState.canReply = false;
+        applyMessagesPaneView('closed');
+        stopMessagePolling();
+        var title = document.getElementById('widgetHeaderTitle');
+        var sub = document.getElementById('widgetHeaderSubtitle');
+        var avatarWrap = document.getElementById('cwHeaderAvatarWrap');
+        if (title) title.textContent = 'Messages';
+        if (sub) sub.textContent = '';
+        if (avatarWrap) avatarWrap.classList.add('hidden');
+        var bottomNav = document.getElementById('widgetBottomNav');
+        if (bottomNav) bottomNav.style.display = 'none';
     }
 
     function syncComposerFeatureButtons() {
@@ -1864,14 +1938,236 @@
             }
             #cwConversationClosedBanner {
                 display: none;
-                margin: 0 12px 8px;
-                padding: 8px 10px;
-                border-radius: 10px;
-                font-size: 12px;
-                color: #64748b;
-                background: #f8fafc;
-                border: 1px solid #e2e8f0;
+            }
+            #cwChatClosedPane {
+                display: none;
+                flex: 1;
+                min-height: 0;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 28px 24px 32px;
+                background: #fff;
                 text-align: center;
+            }
+            #cwChatClosedPane.cw-closed-visible {
+                display: flex;
+            }
+            .cw-closed-check {
+                width: 64px;
+                height: 64px;
+                border-radius: 999px;
+                background: #f1f5f9;
+                color: #334155;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin-bottom: 18px;
+            }
+            .cw-closed-check svg {
+                width: 28px;
+                height: 28px;
+            }
+            .cw-closed-title {
+                margin: 0 0 10px;
+                font-size: 22px;
+                font-weight: 700;
+                color: #0f172a;
+                letter-spacing: -0.02em;
+            }
+            .cw-closed-copy {
+                margin: 0 0 22px;
+                max-width: 280px;
+                font-size: 14px;
+                line-height: 1.5;
+                color: #64748b;
+            }
+            .cw-closed-copy button {
+                appearance: none;
+                border: 0;
+                background: none;
+                padding: 0;
+                margin: 0;
+                font: inherit;
+                font-weight: 600;
+                color: #0f172a;
+                cursor: pointer;
+                text-decoration: underline;
+                text-underline-offset: 2px;
+            }
+            .cw-closed-new-btn {
+                appearance: none;
+                border: 0;
+                border-radius: 10px;
+                background: #0f172a;
+                color: #fff;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 12px 18px;
+                min-width: 180px;
+                cursor: pointer;
+            }
+            #cwConversationsListPane {
+                display: none;
+                flex: 1;
+                min-height: 0;
+                flex-direction: column;
+                overflow: hidden;
+                background: #fff;
+            }
+            #cwConversationsListPane.cw-list-visible {
+                display: flex;
+            }
+            .cw-inbox-scroll {
+                flex: 1;
+                min-height: 0;
+                overflow-y: auto;
+                padding: 0;
+            }
+            .cw-inbox-list {
+                list-style: none;
+                margin: 0;
+                padding: 0;
+                background: #fff;
+            }
+            .cw-inbox-item {
+                width: 100%;
+                text-align: left;
+                appearance: none;
+                border: 0;
+                border-bottom: 1px solid #eef2f7;
+                background: #fff;
+                padding: 14px 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+            .cw-inbox-item:hover {
+                background: #f8fafc;
+            }
+            .cw-inbox-avatar {
+                position: relative;
+                width: 44px;
+                height: 44px;
+                border-radius: 999px;
+                flex-shrink: 0;
+                overflow: hidden;
+                background: #e2e8f0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-size: 15px;
+                font-weight: 700;
+            }
+            .cw-inbox-avatar img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+            }
+            .cw-inbox-avatar-dot {
+                position: absolute;
+                right: 1px;
+                bottom: 1px;
+                width: 10px;
+                height: 10px;
+                border-radius: 999px;
+                background: #22c55e;
+                border: 2px solid #fff;
+            }
+            .cw-inbox-item-body {
+                min-width: 0;
+                flex: 1;
+            }
+            .cw-inbox-item-top {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .cw-inbox-item-title {
+                font-size: 14px;
+                font-weight: 600;
+                color: #0f172a;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .cw-inbox-item-meta {
+                display: flex;
+                flex-direction: column;
+                align-items: flex-end;
+                gap: 6px;
+                flex-shrink: 0;
+            }
+            .cw-inbox-item-time {
+                font-size: 11px;
+                color: #94a3b8;
+                white-space: nowrap;
+            }
+            .cw-inbox-item-preview {
+                margin: 3px 0 0;
+                font-size: 13px;
+                color: #64748b;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .cw-inbox-badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 18px;
+                height: 18px;
+                padding: 0 5px;
+                border-radius: 999px;
+                background: #0f172a;
+                color: #fff;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            .cw-inbox-status-badge {
+                display: inline-flex;
+                align-items: center;
+                flex-shrink: 0;
+                height: 18px;
+                padding: 0 7px;
+                border-radius: 999px;
+                background: #fee2e2;
+                color: #b91c1c;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.02em;
+                text-transform: uppercase;
+            }
+            .cw-inbox-empty {
+                padding: 40px 20px;
+                text-align: center;
+                color: #64748b;
+                font-size: 14px;
+            }
+            .cw-inbox-footer {
+                flex-shrink: 0;
+                padding: 12px 16px 14px;
+                border-top: 1px solid #eef2f7;
+                background: #fff;
+            }
+            .cw-inbox-new-btn {
+                width: 100%;
+                appearance: none;
+                border: 0;
+                border-radius: 10px;
+                background: #0f172a;
+                color: #fff;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 12px 14px;
+                cursor: pointer;
+            }
+            .cw-inbox-new-btn:disabled {
+                opacity: 0.45;
+                cursor: not-allowed;
             }
             
             .animate-spin {
@@ -3965,7 +4261,7 @@
             <div id="chatWidget" class="cw-preline w-[400px] h-[700px] flex flex-col overflow-hidden absolute animate-slide-up chat-widget-window bottom-20 right-0 hidden bg-white">
                 <div class="cw-msg-header hide-on-home" id="mainHeader">
                     <div class="cw-msg-header-inner">
-                        <button type="button" onclick="chatWidget.showScreen('home')" title="Back" aria-label="Back">
+                        <button type="button" id="cwMessagesBackBtn" onclick="chatWidget.handleMessagesBack()" title="Back" aria-label="Back">
                             <svg class="shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
                         </button>
 
@@ -4119,6 +4415,28 @@
                             <p class="text-sm text-slate-500 m-0">Loading...</p>
                         </div>
                     </div>
+                    <div id="cwConversationsListPane" aria-label="Your conversations">
+                        <div class="cw-inbox-scroll" id="cwConversationsListScroll">
+                            <div class="cw-inbox-empty" id="cwConversationsListEmpty">No conversations yet.</div>
+                            <div id="cwConversationsListSections"></div>
+                        </div>
+                        <div class="cw-inbox-footer" id="cwInboxFooter">
+                            <button type="button" class="cw-inbox-new-btn" id="cwInboxNewChatBtn" onclick="chatWidget.startNewChat()">Start a new chat</button>
+                        </div>
+                    </div>
+                    <div id="cwChatClosedPane" aria-live="polite">
+                        <div class="cw-closed-check" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M20 6 9 17l-5-5"/>
+                            </svg>
+                        </div>
+                        <h2 class="cw-closed-title">We're on it!</h2>
+                        <p class="cw-closed-copy">
+                            You'll receive an email reply within a few hours. You can view and update your message in
+                            <button type="button" onclick="chatWidget.showConversationsList()">Previous Conversations</button>.
+                        </p>
+                        <button type="button" class="cw-closed-new-btn" onclick="chatWidget.startNewChat()">Start a new chat</button>
+                    </div>
                     <div class="chat-widget-form-container hidden" id="formContainer" style="display:none;">
                         <div class="cw-prechat-shell">
                             <div class="cw-prechat-close-wrap">
@@ -4210,7 +4528,7 @@
                             <div class="cw-msg-list hidden" id="messagesContainer" style="display:none;"></div>
                         </div>
                     </div>
-                    <div id="cwConversationClosedBanner">This conversation is closed. Start a new chat to send more messages.</div>
+                    <div id="cwConversationClosedBanner" style="display:none;" aria-hidden="true"></div>
                     <footer class="cw-ms-footer hidden" id="inputContainer" style="display:none;">
                         <div id="cwReplyBar" class="cw-reply-compose hidden" style="display:none;" aria-live="polite">
                             <div class="cw-reply-compose-inner">
@@ -4889,9 +5207,14 @@
 
     function applyConversationTypingFromRealtime(data) {
         if (!data || String(data.conversation_number) !== String(widgetState.conversationNumber)) return;
+        // Intentionally hide agent typing from the visitor widget.
+        if (data.actor === 'agent') {
+            clearAgentTypingUi();
+            return;
+        }
         var el = document.getElementById('livechatTypingIndicator');
         if (!el) return;
-        if (data.actor === 'agent' && data.typing) {
+        if (data.typing) {
             var who = (data.label && String(data.label).trim()) ? String(data.label).trim() : 'Agent';
             el.innerHTML = '<span class="lc-typing-label">' + escapeTypingLabel(who) + ' is typing</span>' +
                 '<span class="lc-typing-dots" aria-hidden="true"><b></b><b></b><b></b></span>';
@@ -5697,7 +6020,10 @@
         var prevConv = widgetState.conversationNumber != null ? String(widgetState.conversationNumber) : '';
         if (Object.prototype.hasOwnProperty.call(data, 'conversation_number')) {
             widgetState.conversationNumber = data.conversation_number;
-            if (!data.conversation_number && widgetState.visitorChatPolicy === 'multiple') {
+            if (data.conversation_number) {
+                // Keep list/open scoping in sync so polls and realtime refetch the same thread.
+                widgetState.selectedConversationNumber = String(data.conversation_number);
+            } else if (widgetState.visitorChatPolicy === 'multiple') {
                 widgetState.messages = [];
             }
         }
@@ -5728,7 +6054,7 @@
         };
     }
     
-    async function fetchMessages() {
+    async function fetchMessages(conversationNumber) {
         try {
             const session = await initializeChatSession();
             if (!session || !session.token) {
@@ -5736,8 +6062,12 @@
             }
             
             const visitorId = session.visitor_id || getVisitorId();
+            var fetchOpts = {};
+            if (conversationNumber) {
+                fetchOpts.conversationNumber = conversationNumber;
+            }
             // Messages API endpoint (no channel ID in path)
-            const response = await fetch(getMessagesApiUrl(visitorId), {
+            const response = await fetch(getMessagesApiUrl(visitorId, fetchOpts), {
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${session.token}`,
@@ -5753,7 +6083,7 @@
                     const newSession = await initializeChatSession();
                     if (newSession && newSession.token) {
                         // Retry with new token
-                        const retryResponse = await fetch(getMessagesApiUrl(newSession.visitor_id), {
+                        const retryResponse = await fetch(getMessagesApiUrl(newSession.visitor_id, fetchOpts), {
                             method: 'GET',
                             headers: {
                                 'Authorization': `Bearer ${newSession.token}`,
@@ -5858,6 +6188,11 @@
     function isInboundDirectionForUnread(msg) {
         var d = msg && msg.direction ? String(msg.direction).toLowerCase() : '';
         return d === 'inbound' || d === 'incoming';
+    }
+
+    /** Widget POV: agent/system replies are inbound relative to the visitor. */
+    function isInboundDirection(msg) {
+        return isInboundDirectionForUnread(msg);
     }
 
     function isCountableUnreadMessage(m) {
@@ -6460,7 +6795,190 @@
         return cn !== null && cn !== undefined && cn !== '';
     }
 
+    function isMultipleChatPolicy() {
+        return widgetState.visitorChatPolicy === 'multiple';
+    }
+
+    function formatInboxRelativeTime(iso) {
+        if (!iso) return '';
+        try {
+            var then = new Date(iso).getTime();
+            if (!then) return '';
+            var diff = Math.max(0, Date.now() - then);
+            var mins = Math.floor(diff / 60000);
+            if (mins < 1) return 'Now';
+            if (mins < 60) return mins + 'm';
+            var hours = Math.floor(mins / 60);
+            if (hours < 24) return hours + 'h';
+            var days = Math.floor(hours / 24);
+            if (days < 7) return days + 'd';
+            return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function conversationListTitle(conv, index) {
+        var name = conv && conv.agent_name ? String(conv.agent_name).trim() : '';
+        if (name) return name;
+        return 'Support team';
+    }
+
+    function conversationListInitials(name) {
+        var parts = String(name || 'S').trim().split(/\s+/).filter(Boolean);
+        if (!parts.length) return 'S';
+        var letters = parts.slice(0, 2).map(function (p) { return p.charAt(0).toUpperCase(); });
+        return letters.join('') || 'S';
+    }
+
+    function conversationAvatarHue(seed) {
+        var s = String(seed || 'chat');
+        var hash = 0;
+        for (var i = 0; i < s.length; i++) hash = ((hash << 5) - hash) + s.charCodeAt(i);
+        var hues = [210, 280, 340, 160, 20, 190];
+        return hues[Math.abs(hash) % hues.length];
+    }
+
+    async function fetchVisitorConversations() {
+        try {
+            var session = await initializeChatSession(false);
+            if (!session || !session.token) return [];
+            var visitorId = session.visitor_id || getVisitorId();
+            var response = await fetch(getConversationsApiUrl(visitorId), {
+                method: 'GET',
+                headers: {
+                    'Authorization': 'Bearer ' + session.token,
+                    'Accept': 'application/json'
+                }
+            });
+            if (!response.ok) return [];
+            var data = await response.json();
+            var list = Array.isArray(data.conversations) ? data.conversations : [];
+            widgetState.conversations = list;
+            var hasActive = list.some(function (c) {
+                var s = String((c && c.status) || '').toLowerCase();
+                return s === 'open' || s === 'pending' || c.is_active === true;
+            });
+            widgetState.canStartNewChat = isMultipleChatPolicy() && !hasActive;
+            return list;
+        } catch (e) {
+            cwError('ChatWidget: fetch conversations failed', e);
+            return [];
+        }
+    }
+
+    function renderConversationsList(list) {
+        var sectionsEl = document.getElementById('cwConversationsListSections');
+        var emptyEl = document.getElementById('cwConversationsListEmpty');
+        var newBtn = document.getElementById('cwInboxNewChatBtn');
+        var footer = document.getElementById('cwInboxFooter');
+        if (!sectionsEl) return;
+
+        var conversations = Array.isArray(list) ? list : (widgetState.conversations || []);
+        var items = [];
+        var activeCount = 0;
+        for (var i = 0; i < conversations.length; i++) {
+            var c = conversations[i];
+            if (!c || !c.number) continue;
+            var status = String(c.status || '').toLowerCase();
+            var isActive = status === 'open' || status === 'pending' || c.is_active === true;
+            if (isActive) activeCount++;
+            items.push(c);
+        }
+
+        widgetState.canStartNewChat = isMultipleChatPolicy() && activeCount === 0;
+        if (footer) footer.style.display = (isMultipleChatPolicy() && activeCount === 0) ? '' : 'none';
+        if (newBtn) {
+            newBtn.style.display = '';
+            newBtn.disabled = false;
+            newBtn.textContent = 'Start a new chat';
+        }
+
+        if (items.length === 0) {
+            sectionsEl.innerHTML = '';
+            if (emptyEl) emptyEl.style.display = 'block';
+            if (footer) footer.style.display = isMultipleChatPolicy() ? '' : 'none';
+            return;
+        }
+        if (emptyEl) emptyEl.style.display = 'none';
+
+        var rows = items.map(function (conv, idx) {
+            var status = String(conv.status || '').toLowerCase();
+            var isClosed = !(status === 'open' || status === 'pending' || conv.is_active === true);
+            var titleRaw = conversationListTitle(conv, idx);
+            var title = escapeHtml(titleRaw);
+            var preview = escapeHtml(String(conv.preview || (isClosed ? 'Conversation closed' : 'No messages yet')));
+            var time = escapeHtml(formatInboxRelativeTime(conv.last_message_at));
+            var unread = Math.max(0, parseInt(conv.unread, 10) || 0);
+            var unreadBadge = unread > 0
+                ? ('<span class="cw-inbox-badge">' + (unread > 99 ? '99+' : unread) + '</span>')
+                : '';
+            var closedBadge = isClosed ? '<span class="cw-inbox-status-badge">Closed</span>' : '';
+            var avatarHtml;
+            if (conv.agent_avatar_url) {
+                avatarHtml = '<span class="cw-inbox-avatar"><img src="' + escapeHtml(String(conv.agent_avatar_url)) + '" alt="" /></span>';
+            } else {
+                var hue = conversationAvatarHue(conv.number || titleRaw);
+                avatarHtml = '<span class="cw-inbox-avatar" style="background:hsl(' + hue + ' 70% 48%)">' +
+                    escapeHtml(conversationListInitials(titleRaw)) +
+                    '</span>';
+            }
+            return (
+                '<li>' +
+                    '<button type="button" class="cw-inbox-item" data-cw-open-conversation="' + escapeHtml(String(conv.number)) + '">' +
+                        avatarHtml +
+                        '<span class="cw-inbox-item-body">' +
+                            '<span class="cw-inbox-item-top">' +
+                                '<span class="cw-inbox-item-title">' + title + '</span>' +
+                                closedBadge +
+                            '</span>' +
+                            '<p class="cw-inbox-item-preview">' + preview + '</p>' +
+                        '</span>' +
+                        '<span class="cw-inbox-item-meta">' +
+                            (time ? ('<span class="cw-inbox-item-time">' + time + '</span>') : '') +
+                            unreadBadge +
+                        '</span>' +
+                    '</button>' +
+                '</li>'
+            );
+        }).join('');
+
+        sectionsEl.innerHTML = '<ul class="cw-inbox-list">' + rows + '</ul>';
+
+        var buttons = sectionsEl.querySelectorAll('[data-cw-open-conversation]');
+        for (var b = 0; b < buttons.length; b++) {
+            buttons[b].addEventListener('click', function () {
+                var num = this.getAttribute('data-cw-open-conversation');
+                if (num) void chatWidget.openConversation(num);
+            });
+        }
+    }
+
+    async function showConversationsListPane() {
+        widgetState.messagesPane = 'list';
+        applyMessagesPaneView('list');
+        var title = document.getElementById('widgetHeaderTitle');
+        var sub = document.getElementById('widgetHeaderSubtitle');
+        var avatarWrap = document.getElementById('cwHeaderAvatarWrap');
+        if (title) title.textContent = 'Messages';
+        if (sub) sub.textContent = '';
+        if (avatarWrap) avatarWrap.classList.add('hidden');
+        var bottomNav = document.getElementById('widgetBottomNav');
+        if (bottomNav) bottomNav.style.display = 'flex';
+        stopMessagePolling();
+        var list = await fetchVisitorConversations();
+        renderConversationsList(list);
+        updateBottomNavActive('messages');
+    }
+
     function resolveMessagesEntryViewFromState() {
+        if (isMultipleChatPolicy()) {
+            if (widgetState.messagesPane === 'conversation' && hasConversationNumber()) return 'conversation';
+            if (widgetState.messagesPane === 'form') return 'form';
+            if (widgetState.messagesPane === 'list') return 'list';
+            // Default Messages tab destination for multiple chat.
+            return 'list';
+        }
         if (sessionStorage.getItem('chatWidgetFormSubmitted') === 'true') return 'conversation';
         if (hasConversationNumber()) return 'conversation';
         if (widgetState.formRequired === false) return 'conversation';
@@ -6477,9 +6995,28 @@
         var header = document.getElementById('mainHeader');
         var loaderContainer = document.getElementById('loaderContainer');
         var scroll = document.querySelector('#messagesScreen .cw-ms-scroll');
+        var listPane = document.getElementById('cwConversationsListPane');
+        var closedPane = document.getElementById('cwChatClosedPane');
+        var assignedBar = document.getElementById('assignedAgentBar');
+        var typingEl = document.getElementById('livechatTypingIndicator');
+
+        function hideList() {
+            if (listPane) listPane.classList.remove('cw-list-visible');
+        }
+        function showList() {
+            if (listPane) listPane.classList.add('cw-list-visible');
+        }
+        function hideClosed() {
+            if (closedPane) closedPane.classList.remove('cw-closed-visible');
+        }
+        function showClosed() {
+            if (closedPane) closedPane.classList.add('cw-closed-visible');
+        }
 
         if (view === 'loading') {
             if (loaderContainer) loaderContainer.style.display = 'flex';
+            hideList();
+            hideClosed();
             if (formContainer) {
                 formContainer.classList.add('hidden');
                 formContainer.classList.remove('cw-prechat-visible');
@@ -6493,6 +7030,11 @@
                 input.style.display = 'none';
                 input.classList.add('hidden');
             }
+            if (assignedBar) assignedBar.style.display = 'none';
+            if (typingEl) {
+                typingEl.classList.add('hidden');
+                typingEl.style.display = 'none';
+            }
             if (header) {
                 header.classList.add('hide-on-home');
                 header.style.display = 'none';
@@ -6502,6 +7044,67 @@
         }
 
         if (loaderContainer) loaderContainer.style.display = 'none';
+
+        if (view === 'list') {
+            hideClosed();
+            if (formContainer) {
+                formContainer.classList.add('hidden');
+                formContainer.classList.remove('cw-prechat-visible');
+                formContainer.style.display = 'none';
+            }
+            if (messagesContainer) {
+                messagesContainer.style.display = 'none';
+                messagesContainer.classList.add('hidden');
+            }
+            if (input) {
+                input.style.display = 'none';
+                input.classList.add('hidden');
+            }
+            if (assignedBar) assignedBar.style.display = 'none';
+            if (typingEl) {
+                typingEl.classList.add('hidden');
+                typingEl.style.display = 'none';
+            }
+            if (scroll) scroll.style.display = 'none';
+            showList();
+            if (header && widgetState.currentScreen === 'messages') {
+                header.classList.remove('hide-on-home');
+                header.style.display = 'flex';
+            }
+            return;
+        }
+
+        if (view === 'closed') {
+            hideList();
+            if (formContainer) {
+                formContainer.classList.add('hidden');
+                formContainer.classList.remove('cw-prechat-visible');
+                formContainer.style.display = 'none';
+            }
+            if (messagesContainer) {
+                messagesContainer.style.display = 'none';
+                messagesContainer.classList.add('hidden');
+            }
+            if (input) {
+                input.style.display = 'none';
+                input.classList.add('hidden');
+            }
+            if (assignedBar) assignedBar.style.display = 'none';
+            if (typingEl) {
+                typingEl.classList.add('hidden');
+                typingEl.style.display = 'none';
+            }
+            if (scroll) scroll.style.display = 'none';
+            showClosed();
+            if (header && widgetState.currentScreen === 'messages') {
+                header.classList.remove('hide-on-home');
+                header.style.display = 'flex';
+            }
+            return;
+        }
+
+        hideList();
+        hideClosed();
 
         if (view === 'form') {
             if (formContainer) {
@@ -6791,10 +7394,54 @@
      * After a realtime message event: update state and only append new inbound bubble(s) when possible
      * so we do not clear/rebuild the whole thread (avoids flash when the visitor's own send triggers a broadcast).
      */
+    function appendOptimisticAgentMessageFromRealtime(data) {
+        if (!data || data.is_private) return;
+        var dir = data.direction != null ? String(data.direction).toLowerCase() : '';
+        // Broadcast uses DB direction: agent replies are "outgoing".
+        if (dir && dir !== 'outgoing' && dir !== 'inbound') return;
+        var preview = data.preview != null ? String(data.preview) : '';
+        if (!preview && data.message_id == null) return;
+
+        var optId = data.message_id != null ? ('opt_agent_' + String(data.message_id)) : null;
+        var list = widgetState.messages || [];
+        if (optId) {
+            for (var i = 0; i < list.length; i++) {
+                var existing = list[i];
+                if (!existing) continue;
+                if (String(existing.id) === optId) return;
+                if (existing._db_message_id != null && String(existing._db_message_id) === String(data.message_id)) return;
+            }
+        }
+
+        var msg = {
+            id: optId || ('opt_agent_' + Date.now()),
+            _db_message_id: data.message_id != null ? data.message_id : null,
+            message: preview,
+            direction: 'inbound',
+            from_name: data.agent_name || null,
+            created_at: new Date().toISOString(),
+            status: 'Delivered'
+        };
+        widgetState.messages = list.concat([msg]);
+
+        var mc = document.getElementById('messagesContainer');
+        if (!mc || mc.style.display === 'none' || mc.classList.contains('hidden')) return;
+        // Avoid duplicate bubbles if poll already painted this text as last inbound.
+        if (optId && mc.querySelector('[data-message-id="' + optId + '"]')) return;
+        var rendered = renderMessage(msg);
+        if (rendered) {
+            mc.appendChild(rendered);
+            setTimeout(function() { scrollMessagesToBottom(); }, 30);
+        }
+    }
+
     function applyRealtimeMessageListUpdate(messagesData, conv) {
         syncAssignedAgentFromPayload(messagesData || {});
         var messages = messagesData.messages || [];
-        var prevList = widgetState.messages || [];
+        // Drop optimistic placeholders once the authoritative list arrives.
+        var prevList = (widgetState.messages || []).filter(function(m) {
+            return !(m && m.id != null && String(m.id).indexOf('opt_agent_') === 0);
+        });
         var prevIdSet = new Set();
         for (var i = 0; i < prevList.length; i++) {
             var m = prevList[i];
@@ -6829,10 +7476,20 @@
         }
         widgetState.messages = messages;
         widgetState.conversationNumber = messagesData.conversation_number || conv;
+        if (widgetState.conversationNumber) {
+            widgetState.selectedConversationNumber = String(widgetState.conversationNumber);
+        }
         widgetState.messagesLoaded = true;
         var mc = document.getElementById('messagesContainer');
         if (!mc || mc.style.display === 'none' || mc.classList.contains('hidden')) {
             return;
+        }
+        // Strip optimistic bubbles from the DOM before appending/rebuilding.
+        var optNodes = mc.querySelectorAll('[data-message-id^="opt_agent_"]');
+        for (var oi = 0; oi < optNodes.length; oi++) {
+            if (optNodes[oi] && optNodes[oi].parentNode) {
+                optNodes[oi].parentNode.removeChild(optNodes[oi]);
+            }
         }
         // When polling won the race and already merged the new message into
         // widgetState.messages, `newItems` will be empty. Re-derive the diff
@@ -6842,7 +7499,7 @@
             var renderedIds = new Set();
             for (var rIdx = 0; rIdx < mc.children.length; rIdx++) {
                 var rid = mc.children[rIdx].getAttribute('data-message-id');
-                if (rid && rid.indexOf('temp_') !== 0) {
+                if (rid && rid.indexOf('temp_') !== 0 && rid.indexOf('opt_agent_') !== 0) {
                     renderedIds.add(String(rid));
                 }
             }
@@ -7215,6 +7872,9 @@
                         }
                         if (response && Object.prototype.hasOwnProperty.call(response, 'conversation_number')) {
                             widgetState.conversationNumber = response.conversation_number;
+                            if (response.conversation_number) {
+                                widgetState.selectedConversationNumber = String(response.conversation_number);
+                            }
                         }
                         if (response && response.is_new_conversation) {
                             widgetState.messages = [];
@@ -7761,6 +8421,111 @@
             if (replyMsg) applyReplyToMessage(replyMsg);
         },
 
+        handleMessagesBack: function () {
+            if (isMultipleChatPolicy() && (widgetState.messagesPane === 'conversation' || widgetState.messagesPane === 'closed' || widgetState.messagesPane === 'form')) {
+                void this.showConversationsList();
+                return;
+            }
+            void this.showScreen('home');
+        },
+
+        showConversationsList: async function () {
+            if (!isMultipleChatPolicy()) {
+                void this.showScreen('messages');
+                return;
+            }
+            widgetState.currentScreen = 'messages';
+            var messages = document.getElementById('messagesScreen');
+            var home = document.getElementById('homeScreen');
+            var help = document.getElementById('helpScreen');
+            var bottomNav = document.getElementById('widgetBottomNav');
+            [home, help].forEach(function (s) { if (s) s.classList.remove('active'); });
+            if (messages) messages.classList.add('active');
+            if (bottomNav) bottomNav.style.display = 'none';
+            await showConversationsListPane();
+            updateBottomNavActive('messages');
+        },
+
+        openConversation: async function (conversationNumber) {
+            if (!conversationNumber) return;
+            try {
+                applyMessagesPaneView('loading');
+                widgetState.selectedConversationNumber = String(conversationNumber);
+                widgetState.conversationNumber = String(conversationNumber);
+                widgetState.messagesPane = 'conversation';
+                widgetState.currentScreen = 'messages';
+                var bottomNav = document.getElementById('widgetBottomNav');
+                if (bottomNav) bottomNav.style.display = 'none';
+                var data = await fetchMessages();
+                var list = (data && data.messages) || [];
+                widgetState.messages = list;
+                widgetState.messagesLoaded = true;
+                widgetState.conversationNumber = (data && data.conversation_number) || String(conversationNumber);
+                if (
+                    isMultipleChatPolicy() &&
+                    (widgetState.conversationStatus === 'closed' || widgetState.canReply === false)
+                ) {
+                    showChatClosedConfirmation();
+                    return;
+                }
+                applyMessagesPaneView('conversation');
+                finalizeConversationPane(list);
+                startMessagePolling(5000);
+                void syncLiveChatRealtimeSubscription();
+                syncComposerVoiceCallButton();
+            } catch (e) {
+                cwError('ChatWidget: openConversation failed', e);
+                notifyUser('Could not open that conversation.');
+                await this.showConversationsList();
+            }
+        },
+
+        startNewChat: async function () {
+            if (!isMultipleChatPolicy()) {
+                void this.showScreen('messages');
+                return;
+            }
+            try {
+                await initializeChatSession(false);
+                var list = await fetchVisitorConversations();
+                var hasActive = (list || []).some(function (c) {
+                    var s = String((c && c.status) || '').toLowerCase();
+                    return s === 'open' || s === 'pending' || c.is_active === true;
+                });
+                if (hasActive) {
+                    notifyUser('Close your current chat before starting a new one.');
+                    await this.showConversationsList();
+                    return;
+                }
+
+                widgetState.selectedConversationNumber = null;
+                widgetState.conversationNumber = null;
+                widgetState.messages = [];
+                widgetState.messagesLoaded = true;
+                widgetState.conversationStatus = null;
+                widgetState.canReply = true;
+                widgetState.currentScreen = 'messages';
+
+                var needsForm = widgetState.formRequired === true
+                    && sessionStorage.getItem('chatWidgetFormSubmitted') !== 'true';
+                if (needsForm) {
+                    widgetState.messagesPane = 'form';
+                    applyMessagesPaneView('form');
+                } else {
+                    widgetState.messagesPane = 'conversation';
+                    applyMessagesPaneView('conversation');
+                    finalizeConversationPane([]);
+                    startMessagePolling(5000);
+                }
+                var bottomNav = document.getElementById('widgetBottomNav');
+                if (bottomNav) bottomNav.style.display = 'none';
+                updateBottomNavActive('messages');
+            } catch (e) {
+                cwError('ChatWidget: startNewChat failed', e);
+                notifyUser('Could not start a new chat.');
+            }
+        },
+
         showScreen: async function(screen) {
             if (screen === 'messages' && !isDirectMessageEnabled(widgetState.widgetSettings)) {
                 screen = 'home';
@@ -7817,12 +8582,21 @@
                 } else if (screen === 'messages') {
                     messages.classList.add('active');
                     installMessagesContainerClickDelegation();
+                    try { bindSilentComposerMediaDrop(); } catch (eDropBind) {}
                     clearUnreadCount();
-                    if (bottomNav) bottomNav.style.display = 'none';
+                    if (bottomNav) {
+                        bottomNav.style.display = (isMultipleChatPolicy() && resolveMessagesEntryViewFromState() === 'list')
+                            ? 'flex'
+                            : 'none';
+                    }
                     widgetState.currentScreen = 'messages';
 
                     var knownView = resolveMessagesEntryViewFromState();
-                    if (knownView) {
+                    if (knownView === 'list') {
+                        await showConversationsListPane();
+                        updateBottomNavActive('messages');
+                    } else if (knownView) {
+                        if (bottomNav) bottomNav.style.display = 'none';
                         applyMessagesPaneView(knownView);
                         if (knownView === 'conversation') {
                             finalizeConversationPane(widgetState.messages);
@@ -7838,19 +8612,29 @@
                             } else {
                                 await ensureMessagesEntryState();
                             }
-                            var resolvedView = resolveMessagesEntryViewFromState() || 'conversation';
-                            applyMessagesPaneView(resolvedView);
-                            if (resolvedView === 'conversation') {
-                                finalizeConversationPane(widgetState.messages);
+                            var resolvedView = resolveMessagesEntryViewFromState() || (isMultipleChatPolicy() ? 'list' : 'conversation');
+                            if (resolvedView === 'list') {
+                                await showConversationsListPane();
+                            } else {
+                                if (bottomNav) bottomNav.style.display = 'none';
+                                applyMessagesPaneView(resolvedView);
+                                if (resolvedView === 'conversation') {
+                                    finalizeConversationPane(widgetState.messages);
+                                }
+                                startMessagePolling(5000);
                             }
-                            startMessagePolling(5000);
                             updateBottomNavActive('messages');
                             syncComposerVoiceCallButton();
                         } catch (error) {
                             cwError('Error loading messages:', error);
-                            applyMessagesPaneView('conversation');
-                            finalizeConversationPane([]);
-                            startMessagePolling(5000);
+                            if (isMultipleChatPolicy()) {
+                                await showConversationsListPane();
+                            } else {
+                                if (bottomNav) bottomNav.style.display = 'none';
+                                applyMessagesPaneView('conversation');
+                                finalizeConversationPane([]);
+                                startMessagePolling(5000);
+                            }
                             updateBottomNavActive('messages');
                         }
                     }
@@ -7972,6 +8756,7 @@
                         
                         // On successful send, hide form and show messages
                         formContainer.classList.remove('active');
+                        widgetState.messagesPane = 'conversation';
                         applyMessagesPaneView('conversation');
                         
                         // Fetch and display messages from API
@@ -7980,6 +8765,7 @@
                         // Update cached state
                         widgetState.messages = messagesData.messages;
                         widgetState.conversationNumber = messagesData.conversation_number;
+                        widgetState.selectedConversationNumber = messagesData.conversation_number || null;
                         widgetState.messagesLoaded = true;
                         widgetState.formRequired = false;
                         
@@ -8093,10 +8879,12 @@
                 return;
             }
             let file = null;
-            if (event.target && event.target.files && event.target.files.length > 0) {
-                file = event.target.files[0];
-            } else if (event.target && event.target.files && Array.isArray(event.target.files) && event.target.files.length > 0) {
-                file = event.target.files[0];
+            var fileList = event && event.target ? event.target.files : null;
+            if ((!fileList || !fileList.length) && event && event.dataTransfer) {
+                fileList = event.dataTransfer.files;
+            }
+            if (fileList && fileList.length > 0) {
+                file = fileList[0] || (typeof fileList.item === 'function' ? fileList.item(0) : null);
             }
             if (!file) return;
             
@@ -8760,31 +9548,78 @@
         var targets = [
             document.getElementById('messagesScreen'),
             document.getElementById('inputContainer'),
+            document.getElementById('chatInput'),
             document.getElementById('chatWidget')
         ].filter(Boolean);
-        targets.forEach(function(el) {
-            if (el.getAttribute('data-cw-silent-drop') === '1') return;
-            el.setAttribute('data-cw-silent-drop', '1');
-            el.addEventListener('dragover', function(e) {
-                if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) return;
-                if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) return;
-                if (!e.dataTransfer) return;
-                var types = Array.prototype.slice.call(e.dataTransfer.types || []);
-                if (types.indexOf('Files') === -1) return;
-                e.preventDefault();
-                e.dataTransfer.dropEffect = 'copy';
-            }, false);
-            el.addEventListener('drop', function(e) {
-                if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) return;
-                if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) return;
-                var files = e.dataTransfer && e.dataTransfer.files;
-                if (!files || !files.length) return;
-                e.preventDefault();
-                e.stopPropagation();
-                if (window.chatWidget && typeof window.chatWidget.handleFileSelect === 'function') {
-                    window.chatWidget.handleFileSelect({ target: { files: files } });
+
+        function dropHasFiles(dt) {
+            if (!dt) return false;
+            if (dt.files && dt.files.length > 0) return true;
+            var types = Array.prototype.slice.call(dt.types || []);
+            return types.indexOf('Files') !== -1;
+        }
+
+        function isFileUploadPopupOpen() {
+            var popup = document.getElementById('fileUploadPopup');
+            return !!(popup && !popup.classList.contains('hidden'));
+        }
+
+        function isInsideFileUploadPopup(target) {
+            if (!target || !target.closest) return false;
+            return !!target.closest('#fileUploadPopup');
+        }
+
+        function openUploadModalForDrag() {
+            if (!window.chatWidget || typeof window.chatWidget.showFileUploadPopup !== 'function') return;
+            if (isFileUploadPopupOpen()) {
+                // Ensure drop-zone listeners are ready while dragging.
+                if (typeof window.chatWidget.initializeFileUpload === 'function') {
+                    window.chatWidget.initializeFileUpload();
                 }
-            }, false);
+                return;
+            }
+            window.chatWidget.showFileUploadPopup();
+        }
+
+        function onDragEnterOrOver(e) {
+            if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) return;
+            if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) return;
+            if (!dropHasFiles(e.dataTransfer)) return;
+            // Let the modal drop-zone handle its own highlight when already open.
+            if (isInsideFileUploadPopup(e.target)) {
+                e.preventDefault();
+                try { e.dataTransfer.dropEffect = 'copy'; } catch (err) {}
+                return;
+            }
+            e.preventDefault();
+            e.stopPropagation();
+            try { e.dataTransfer.dropEffect = 'copy'; } catch (err2) {}
+            openUploadModalForDrag();
+        }
+
+        function onDrop(e) {
+            if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) return;
+            if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) return;
+            var files = e.dataTransfer && e.dataTransfer.files;
+            if (!files || !files.length) return;
+
+            // If drop is already inside the upload modal zone, leave it to that handler.
+            if (isInsideFileUploadPopup(e.target)) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+            openUploadModalForDrag();
+            if (window.chatWidget && typeof window.chatWidget.handleFileSelect === 'function') {
+                window.chatWidget.handleFileSelect({ target: { files: files } });
+            }
+        }
+
+        targets.forEach(function(el) {
+            if (el.getAttribute('data-cw-media-drag') === '1') return;
+            el.setAttribute('data-cw-media-drag', '1');
+            el.addEventListener('dragenter', onDragEnterOrOver, true);
+            el.addEventListener('dragover', onDragEnterOrOver, true);
+            el.addEventListener('drop', onDrop, true);
         });
     }
 
