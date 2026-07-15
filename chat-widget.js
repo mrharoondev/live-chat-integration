@@ -58,7 +58,8 @@
         if (visitorId) u.searchParams.set('visitor_id', String(visitorId));
         if (opts.agentMetaOnly) {
             u.searchParams.set('agent_meta_only', '1');
-        } else {
+        } else if (widgetState.visitorChatPolicy !== 'multiple') {
+            // Single-session: allow identity history. Multiple: latest/active thread only.
             u.searchParams.set('all', '1');
         }
         return u.toString();
@@ -271,7 +272,9 @@
         selectedMessageId: null,
         highlightedReplyTargetId: null,
         pendingInReplyOf: null,
-        editingMessageNumber: null
+        editingMessageNumber: null,
+        conversationStatus: null,
+        canReply: true
     };
     
     // Reset state on page load (for fresh load)
@@ -290,7 +293,9 @@
             selectedMessageId: null,
             highlightedReplyTargetId: null,
             pendingInReplyOf: null,
-            editingMessageNumber: null
+            editingMessageNumber: null,
+            conversationStatus: null,
+            canReply: true
         };
     }
     
@@ -640,6 +645,7 @@
             ch.unbind('conversation-typing');
             ch.unbind('conversation-assignment-updated');
             ch.unbind('webrtc-signal');
+            ch.unbind('conversation-status-updated');
             ch.bind('message-received', function(data) {
                 if (!data || String(data.conversation_number) !== String(conv)) {
                     return;
@@ -671,6 +677,16 @@
                 fetchMessages().then(function(messagesData) {
                     applyRealtimeMessageListUpdate(messagesData, conv);
                 }).catch(function() {});
+            });
+            ch.bind('conversation-status-updated', function(data) {
+                if (!data || String(data.conversation_number) !== String(conv)) return;
+                widgetState.conversationStatus = data.status || null;
+                if (widgetState.visitorChatPolicy === 'multiple' && data.status === 'closed') {
+                    widgetState.canReply = false;
+                } else if (data.status === 'open' || data.status === 'pending') {
+                    widgetState.canReply = true;
+                }
+                if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
             });
             ch.bind('webrtc-signal', function(data) {
                 void handleVisitorWebRtcSignal(data);
@@ -1077,6 +1093,63 @@
         if (cfg && cfg.voiceCallEnabled === true) return true;
         var settings = widgetState && widgetState.widgetSettings;
         return !!(settings && settings.voice_call_enabled === true);
+    }
+
+    function isMediaUploadEnabled() {
+        var settings = widgetState && widgetState.widgetSettings;
+        if (!settings) return true;
+        return settings.media_upload_enabled !== false;
+    }
+
+    function isVoiceMessageEnabled() {
+        var settings = widgetState && widgetState.widgetSettings;
+        if (!settings) return true;
+        return settings.voice_message_enabled !== false;
+    }
+
+    function isShowAgentDetailEnabled() {
+        var settings = widgetState && widgetState.widgetSettings;
+        if (!settings) return true;
+        return settings.show_agent_detail !== false;
+    }
+
+    function isConversationReplyAllowed() {
+        if (widgetState.visitorChatPolicy === 'multiple' && widgetState.conversationStatus === 'closed') {
+            return false;
+        }
+        if (widgetState.canReply === false) return false;
+        return true;
+    }
+
+    function syncComposerClosedState() {
+        var input = document.getElementById('chatInput');
+        var sendBtn = document.getElementById('sendButton');
+        var banner = document.getElementById('cwConversationClosedBanner');
+        var allowed = isConversationReplyAllowed();
+        if (input) {
+            input.disabled = !allowed;
+            if (!allowed) input.placeholder = 'This conversation is closed';
+            else if (typeof syncChatInputPlaceholder === 'function') syncChatInputPlaceholder();
+        }
+        if (sendBtn && !allowed) sendBtn.disabled = true;
+        if (banner) banner.style.display = allowed ? 'none' : 'block';
+        var attachBtn = document.getElementById('cwComposerAttachBtn');
+        var voiceBtn = document.getElementById('cwComposerVoiceBtn');
+        var callBtn = document.getElementById('cwComposerCallBtn');
+        if (attachBtn) attachBtn.disabled = !allowed || !isMediaUploadEnabled();
+        if (voiceBtn) voiceBtn.disabled = !allowed || !isVoiceMessageEnabled();
+        if (callBtn && !allowed) callBtn.disabled = true;
+    }
+
+    function syncComposerFeatureButtons() {
+        var attachBtn = document.getElementById('cwComposerAttachBtn');
+        var voiceBtn = document.getElementById('cwComposerVoiceBtn');
+        var formAttach = document.querySelector('#preChatForm button[onclick*="showFileUploadPopup"]');
+        if (attachBtn) attachBtn.style.display = isMediaUploadEnabled() ? '' : 'none';
+        if (formAttach) formAttach.style.display = isMediaUploadEnabled() ? '' : 'none';
+        if (voiceBtn) voiceBtn.style.display = isVoiceMessageEnabled() ? '' : 'none';
+        syncComposerVoiceCallButton();
+        syncComposerClosedState();
     }
 
     function formatVisitorCallDuration(totalSeconds) {
@@ -1749,6 +1822,28 @@
             }
             .lc-typing-dots b:nth-child(2) { animation-delay: 0.18s; }
             .lc-typing-dots b:nth-child(3) { animation-delay: 0.36s; }
+
+            #livechatTypingIndicator.cw-typing-under-messages {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin: 4px 8px 10px;
+                padding: 6px 10px;
+                border-radius: 12px;
+                background: rgba(148, 163, 184, 0.12);
+                transition: opacity 0.2s ease, transform 0.2s ease;
+            }
+            #cwConversationClosedBanner {
+                display: none;
+                margin: 0 12px 8px;
+                padding: 8px 10px;
+                border-radius: 10px;
+                font-size: 12px;
+                color: #64748b;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                text-align: center;
+            }
             
             .animate-spin {
                 animation: spin 1s linear infinite;
@@ -4086,6 +4181,7 @@
                             <div class="cw-msg-list hidden" id="messagesContainer" style="display:none;"></div>
                         </div>
                     </div>
+                    <div id="cwConversationClosedBanner">This conversation is closed. Start a new chat to send more messages.</div>
                     <footer class="cw-ms-footer hidden" id="inputContainer" style="display:none;">
                         <div id="cwReplyBar" class="cw-reply-compose hidden" style="display:none;" aria-live="polite">
                             <div class="cw-reply-compose-inner">
@@ -4267,6 +4363,10 @@
 
     function resolveAgentLabelForMessage(message) {
         try {
+            if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
+                var bn = widgetState && widgetState.widgetSettings && widgetState.widgetSettings.brand_name;
+                return bn ? String(bn) : 'Support';
+            }
             if (message && message.from_name && String(message.from_name).trim()) return String(message.from_name).trim();
             var ag = widgetState && widgetState.assignedAgent;
             if (ag && ag.name && String(ag.name).trim()) return String(ag.name).trim();
@@ -4749,6 +4849,15 @@
             .replace(/"/g, '&quot;');
     }
 
+    function placeTypingIndicatorUnderLastMessage() {
+        var el = document.getElementById('livechatTypingIndicator');
+        var mc = document.getElementById('messagesContainer');
+        if (!el || !mc) return;
+        mc.appendChild(el);
+        el.classList.add('cw-typing-under-messages');
+        setTimeout(function() { scrollMessagesToBottom(); }, 30);
+    }
+
     function applyConversationTypingFromRealtime(data) {
         if (!data || String(data.conversation_number) !== String(widgetState.conversationNumber)) return;
         var el = document.getElementById('livechatTypingIndicator');
@@ -4759,10 +4868,11 @@
                 '<span class="lc-typing-dots" aria-hidden="true"><b></b><b></b><b></b></span>';
             el.classList.remove('hidden');
             el.style.display = 'flex';
+            placeTypingIndicatorUnderLastMessage();
             if (agentTypingHideTimer) clearTimeout(agentTypingHideTimer);
             agentTypingHideTimer = setTimeout(function() {
                 clearAgentTypingUi();
-            }, 5000);
+            }, 8000);
         } else {
             clearAgentTypingUi();
         }
@@ -4818,6 +4928,10 @@
     }
 
     function buildInboundAvatarHtml() {
+        if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
+            return '';
+        }
+
         var ag = widgetState && widgetState.assignedAgent;
         if (ag && ag.avatar_url) {
             return '<img class="cw-msg-avatar-img" src="' + escapeHtml(String(ag.avatar_url)) + '" alt="" width="28" height="28" loading="lazy" decoding="async"/>';
@@ -4864,34 +4978,14 @@
     function buildMessageMenuHtml(menuId, messageId, options) {
         var mid = messageId != null ? String(messageId) : '';
         var o = options || {};
-        var placementClass = o.placement === 'left' ? 'cw-message-menu-left' : 'cw-message-menu-right';
         var orderClass = o.order != null ? (' order-' + String(o.order)) : '';
-        var items = '';
-
-        if (o.edit) {
-            items += '<button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction(\'edit\',\'' + mid + '\')">' +
-                '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>' +
-                'Edit</button>';
-        }
-        if (o.reply) {
-            items += '<button type="button" class="cw-message-menu-item" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction(\'reply\',\'' + mid + '\')">' +
-                '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="m10 7-3 3 3 3"/><path d="M17 13v-1a2 2 0 0 0-2-2H7"/></svg>' +
-                'Reply</button>';
-        }
-        if (o.delete) {
-            items += '<button type="button" class="cw-message-menu-item cw-danger" role="menuitem" onclick="event.stopPropagation();chatWidget.messageAction(\'delete\',\'' + mid + '\')">' +
-                '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>' +
-                'Delete</button>';
-        }
-
-        return '<div class="cw-msg-actions' + orderClass + '"><div class="cw-message-menu-wrap"><div class="cw-message-menu-dropdown">' +
-            '<button type="button" data-cw-menu-trigger="1" class="cw-message-menu-trigger" aria-haspopup="menu" aria-expanded="false" aria-label="Message actions" onclick="chatWidget.toggleMessageMenu(event, \'' + menuId + '\')">' +
-            '<svg class="cw-message-menu-trigger-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>' +
-            '</button>' +
-            '<div id="' + menuId + '" class="cw-message-menu ' + placementClass + ' hidden" role="menu" aria-label="Message actions">' +
-            '<div class="cw-message-menu-inner">' + items + '</div></div></div></div></div>';
+        if (!o.reply) return '';
+        return '<div class="cw-msg-actions' + orderClass + '"><div class="cw-message-menu-wrap cw-reply-action-wrap">' +
+            '<button type="button" class="cw-message-menu-trigger cw-reply-direct-btn" aria-label="Reply" title="Reply" onclick="event.stopPropagation();chatWidget.messageAction(\'reply\',\'' + mid + '\')">' +
+            '<svg class="cw-message-menu-trigger-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="m10 7-3 3 3 3"/><path d="M17 13v-1a2 2 0 0 0-2-2H7"/></svg>' +
+            '</button></div></div>';
     }
-    
+
     function extractCallAttachment(message) {
         if (!message) return null;
         if (message.call && typeof message.call === 'object') return message.call;
@@ -5002,17 +5096,8 @@
             (message && message.assignment_tags) ||
             (message && message.status_log_tags);
         if (isTimeline) {
-            var sysWrap = document.createElement('div');
-            sysWrap.className = 'cw-msg-wrap cw-msg-system cw-msg-interactive w-full max-w-full animate-fade-in';
-            if (message && message.id != null) {
-                sysWrap.setAttribute('data-message-id', String(message.id));
-            }
-            var sysPill = document.createElement('div');
-            sysPill.className = 'cw-system-pill';
-            sysPill.setAttribute('role', 'status');
-            sysPill.textContent = String((message && message.message) || '').trim();
-            sysWrap.appendChild(sysPill);
-            return sysWrap;
+            // Status / assignment logs are intentionally hidden in the visitor widget.
+            return null;
         }
 
         if (extractCallAttachment(message)) {
@@ -5391,11 +5476,8 @@
                     '<span class="cw-bubble-meta"><span class="cw-time cw-bubble-footer" title="' + outTitle + '">' + escapeHtml(outClock) + '</span>' +
                     '<span data-outbound-ticks="1">' + tickHtml + '</span></span></div></div>')
                 : '';
-            var allowEditDelete = !messageHasAudioOrVideoMedia(message);
             var outMenuHtml = buildMessageMenuHtml(outMenuId, midStrOut, {
-                edit: allowEditDelete,
                 reply: true,
-                delete: allowEditDelete,
                 placement: 'right',
                 order: 1
             });
@@ -5436,6 +5518,18 @@
 
     /** Messages header: agent avatar + name (Preline-style). */
     function syncWidgetMessagesHeaderForAssignee() {
+        if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
+            var titleEl0 = document.getElementById('widgetHeaderTitle');
+            var subEl0 = document.getElementById('widgetHeaderSubtitle');
+            var wrap0 = document.getElementById('cwHeaderAvatarWrap');
+            if (titleEl0 && widgetState.widgetSettings) {
+                titleEl0.textContent = widgetState.widgetSettings.brand_name || 'Chat';
+            }
+            if (subEl0) subEl0.textContent = isWidgetBusinessOnline() ? 'Online' : 'Away';
+            if (wrap0) wrap0.classList.add('hidden');
+            return;
+        }
+
         var sub = document.getElementById('widgetHeaderSubtitle');
         var title = document.getElementById('widgetHeaderTitle');
         if (!sub || !title) return;
@@ -5464,6 +5558,16 @@
         var wrap = document.getElementById('cwHeaderAvatarWrap');
         var img = document.getElementById('cwHeaderAvatarImg');
         var dot = document.getElementById('cwHeaderPresenceDot');
+
+        if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
+            if (wrap) wrap.classList.add('hidden');
+            var barHide = document.getElementById('assignedAgentBar');
+            if (barHide) {
+                barHide.classList.add('hidden');
+                barHide.style.display = 'none';
+            }
+            return;
+        }
 
         var bar = document.getElementById('assignedAgentBar');
         var nameEl = document.getElementById('assignedAgentName');
@@ -5568,7 +5672,17 @@
                 widgetState.messages = [];
             }
         }
+        if (Object.prototype.hasOwnProperty.call(data, 'conversation_status')) {
+            widgetState.conversationStatus = data.conversation_status || null;
+        }
+        if (Object.prototype.hasOwnProperty.call(data, 'can_reply')) {
+            widgetState.canReply = data.can_reply !== false;
+        }
+        if (data.visitor_chat_policy) {
+            widgetState.visitorChatPolicy = data.visitor_chat_policy;
+        }
         syncAssignedAgentFromPayload(data);
+        if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
         var nextConv = widgetState.conversationNumber != null ? String(widgetState.conversationNumber) : '';
         var convChanged = prevConv !== nextConv;
         if (convChanged || !realtimeSubscribedConv) {
@@ -5717,24 +5831,39 @@
         return d === 'inbound' || d === 'incoming';
     }
 
+    function isCountableUnreadMessage(m) {
+        if (!m || m.id == null) return false;
+        if (String(m.id).indexOf('temp_') === 0) return false;
+        if (m.assignment_tags || m.status_log_tags) return false;
+        var d = m.direction ? String(m.direction).toLowerCase() : '';
+        if (d === 'system') return false;
+        if (typeof extractCallAttachment === 'function' && extractCallAttachment(m)) return false;
+        if (m.call && typeof m.call === 'object') return false;
+        return isInboundDirectionForUnread(m);
+    }
+
+    /**
+     * Message "numbers" are random public IDs, not chronological.
+     * Unread must be based on list order (API returns chronological), with last_seen as a watermark id.
+     */
     function computeUnreadCountFromMessages(messages, lastSeen) {
         if (!Array.isArray(messages) || messages.length === 0) return 0;
         if (lastSeen == null || String(lastSeen) === '') return 0;
-        var lastSeenNum = Number(lastSeen);
-        var hasNumeric = Number.isFinite(lastSeenNum);
         var unread = 0;
+        var seenWatermark = false;
+        var lastSeenStr = String(lastSeen);
         for (var i = 0; i < messages.length; i++) {
             var m = messages[i];
             if (!m || m.id == null) continue;
-            if (!isInboundDirectionForUnread(m)) continue;
-            if (hasNumeric) {
-                var idNum = Number(m.id);
-                if (Number.isFinite(idNum) && idNum > lastSeenNum) unread++;
-            } else {
-                // Fallback: if ids are not numeric, treat any mismatch as "1 unread".
-                if (String(m.id) !== String(lastSeen)) unread = 1;
+            if (String(m.id) === lastSeenStr) {
+                seenWatermark = true;
+                continue;
             }
+            if (!seenWatermark) continue;
+            if (isCountableUnreadMessage(m)) unread++;
         }
+        // Watermark missing (pruned history / identity change) — don't invent a spike.
+        if (!seenWatermark) return 0;
         return unread;
     }
 
@@ -5742,11 +5871,34 @@
         if (!Array.isArray(messages) || messages.length === 0) return null;
         for (var i = messages.length - 1; i >= 0; i--) {
             var m = messages[i];
-            if (m && m.id != null && isInboundDirectionForUnread(m)) {
+            if (isCountableUnreadMessage(m)) {
                 return m.id;
             }
         }
         return null;
+    }
+
+    /** When the visitor is viewing the thread, advance past everything currently loaded. */
+    function getThreadReadWatermark(messages) {
+        if (!Array.isArray(messages) || messages.length === 0) return null;
+        for (var i = messages.length - 1; i >= 0; i--) {
+            var m = messages[i];
+            if (!m || m.id == null) continue;
+            if (String(m.id).indexOf('temp_') === 0) continue;
+            return m.id;
+        }
+        return null;
+    }
+
+    function markThreadAsSeen(messages) {
+        var watermark = getThreadReadWatermark(messages);
+        if (watermark == null) {
+            clearUnreadCount();
+            return;
+        }
+        setLastSeenMessageId(watermark);
+        clearUnreadCount();
+        void markSeenUpTo(watermark);
     }
 
     async function markSeenUpTo(lastSeenInboundId) {
@@ -5794,16 +5946,30 @@
             widgetState.messagesLoaded = true;
 
             const lastSeen = getLastSeenMessageId();
-            const latestInboundId = getLatestInboundId(fresh);
 
-            // First run: just establish baseline (avoid false unread spike).
+            // First run: establish baseline at the end of the loaded thread
+            // (message numbers are random — never compare numerically).
             if (!lastSeen) {
-                if (latestInboundId != null) setLastSeenMessageId(latestInboundId);
+                var baseline = getThreadReadWatermark(fresh);
+                if (baseline != null) setLastSeenMessageId(baseline);
                 setUnreadCount(0);
                 return;
             }
 
             var unreadNow = computeUnreadCountFromMessages(fresh, lastSeen);
+            // Stale watermark not in list: re-baseline instead of leaving a stuck badge.
+            if (unreadNow === 0 && getUnreadCount() > 0) {
+                var found = false;
+                for (var wi = 0; wi < fresh.length; wi++) {
+                    if (fresh[wi] && String(fresh[wi].id) === String(lastSeen)) { found = true; break; }
+                }
+                if (!found) {
+                    var resetMark = getThreadReadWatermark(fresh);
+                    if (resetMark != null) setLastSeenMessageId(resetMark);
+                    setUnreadCount(0);
+                    return;
+                }
+            }
             var prevUnread = getUnreadCount();
             setUnreadCount(unreadNow);
 
@@ -5887,15 +6053,7 @@
             // widget. (Without this, a poll-delivered message would inflate
             // the badge because last_seen still points at the previous reply.)
             if (isViewingMessages()) {
-                const latestInboundIdSeen = getLatestInboundId(fresh);
-                if (latestInboundIdSeen != null) {
-                    const prevSeen = getLastSeenMessageId();
-                    if (String(prevSeen ?? '') !== String(latestInboundIdSeen)) {
-                        setLastSeenMessageId(latestInboundIdSeen);
-                        void markSeenUpTo(latestInboundIdSeen);
-                    }
-                }
-                clearUnreadCount();
+                markThreadAsSeen(fresh);
             }
         } catch (e) {
             // Swallow polling errors; widget still works for sending.
@@ -6142,7 +6300,8 @@
             widgetState.visitorChatPolicy = settings.visitor_chat_policy;
         }
         updateAssignedAgentBarUi();
-        syncComposerVoiceCallButton();
+        if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
+        else syncComposerVoiceCallButton();
     }
 
     function openExternalAndClose(url) {
@@ -6167,6 +6326,12 @@
         if (!settings) return true;
         var container = document.getElementById('chatWidgetContainer');
         if (!container) return false;
+        if (settings.status === false) {
+            container.style.display = 'none';
+            container.setAttribute('data-cw-disabled', '1');
+            return false;
+        }
+        container.removeAttribute('data-cw-disabled');
         if (!isDomainAllowed(settings)) {
             container.style.display = 'none';
             return false;
@@ -6359,13 +6524,10 @@
     function finalizeConversationPane(messages) {
         var list = messages != null ? messages : (widgetState.messages || []);
         displayMessages(list);
-        var lastInbound = getLatestInboundId(list);
-        if (lastInbound != null) {
-            setLastSeenMessageId(lastInbound);
-            void markSeenUpTo(lastInbound);
-        }
+        markThreadAsSeen(list);
         updateAssignedAgentBarUi();
-        syncComposerVoiceCallButton();
+        if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
+        else syncComposerVoiceCallButton();
     }
 
     async function ensureMessagesEntryState() {
@@ -6615,16 +6777,11 @@
             return msg && msg.id != null && !prevIdSet.has(String(msg.id));
         });
 
-        function isInboundDirection(msg) {
-            var d = msg && msg.direction ? String(msg.direction).toLowerCase() : '';
-            return d === 'inbound' || d === 'incoming';
-        }
-
-        // Unread counter + notification sound: only for new inbound items when visitor isn't actively viewing messages.
+        // Unread counter + notification sound: only for new inbound chat items (not call logs).
         if (newItems.length > 0) {
             var inboundCount = 0;
             for (var ni = 0; ni < newItems.length; ni++) {
-                if (isInboundDirection(newItems[ni])) inboundCount++;
+                if (isCountableUnreadMessage(newItems[ni])) inboundCount++;
             }
             if (inboundCount > 0) {
                 if (!isViewingMessages()) {
@@ -6637,12 +6794,7 @@
                         playNotificationSound();
                     }
                 } else {
-                    clearUnreadCount();
-                    var lastInbound = getLatestInboundId(messages);
-                    if (lastInbound != null) {
-                        setLastSeenMessageId(lastInbound);
-                        void markSeenUpTo(lastInbound);
-                    }
+                    markThreadAsSeen(messages);
                 }
             }
         }
@@ -6677,7 +6829,8 @@
         });
         if (allInbound) {
             for (var j = 0; j < newItems.length; j++) {
-                mc.appendChild(renderMessage(newItems[j]));
+                var renderedRt = renderMessage(newItems[j]);
+                if (renderedRt) mc.appendChild(renderedRt);
             }
             hydrateAllLinkPreviewCards(mc);
             setTimeout(function() {
@@ -6777,11 +6930,15 @@
                 }
             }
             const messageElement = renderMessage(msg);
-            messagesContainer.appendChild(messageElement);
+            if (messageElement) messagesContainer.appendChild(messageElement);
         }
-        
+        var typingEl = document.getElementById('livechatTypingIndicator');
+        if (typingEl && typingEl.style.display !== 'none' && !typingEl.classList.contains('hidden')) {
+            messagesContainer.appendChild(typingEl);
+        }
         hydrateAllLinkPreviewCards(messagesContainer);
         syncChatInputPlaceholder();
+        if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
         scrollMessagesToBottom();
     }
     
@@ -6854,14 +7011,10 @@
                 // because the realtime diff has nothing to append when polling
                 // already merged the new message into `widgetState.messages`.
                 if (widgetState.currentScreen === 'messages') {
-                    clearUnreadCount();
-                    // Visitor is viewing the thread; mark latest as seen to prevent badge bounce.
                     if (Array.isArray(widgetState.messages) && widgetState.messages.length) {
-                        var lastInbound = getLatestInboundId(widgetState.messages);
-                        if (lastInbound != null) {
-                            setLastSeenMessageId(lastInbound);
-                            void markSeenUpTo(lastInbound);
-                        }
+                        markThreadAsSeen(widgetState.messages);
+                    } else {
+                        clearUnreadCount();
                     }
                     // Immediately repaint with whatever we already have…
                     if (Array.isArray(widgetState.messages)) {
@@ -6878,11 +7031,7 @@
                             widgetState.conversationNumber = data && data.conversation_number || widgetState.conversationNumber || null;
                             widgetState.messagesLoaded = true;
                             displayMessages(fresh);
-                            var lastInboundFresh = getLatestInboundId(fresh);
-                            if (lastInboundFresh != null) {
-                                setLastSeenMessageId(lastInboundFresh);
-                                void markSeenUpTo(lastInboundFresh);
-                            }
+                            markThreadAsSeen(fresh);
                         } catch (e) {}
                     })();
                     // Keep the thread live while the widget is open.
@@ -6909,6 +7058,11 @@
         },
         
         sendMsg: async function() {
+            if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) {
+                notifyUser('This conversation is closed.');
+                return;
+            }
+
             const i = document.getElementById('chatInput');
             const b = document.getElementById('sendButton');
             if (!i || !b) {
@@ -7293,6 +7447,15 @@
         },
 
         toggleVoiceRecording: async function () {
+            if (typeof isVoiceMessageEnabled === 'function' && !isVoiceMessageEnabled()) {
+                notifyUser('Voice messages are disabled.');
+                return;
+            }
+            if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) {
+                notifyUser('This conversation is closed.');
+                return;
+            }
+
             var btn = document.getElementById('cwComposerVoiceBtn');
             var self = this;
             try {
@@ -7563,29 +7726,12 @@
         },
 
         messageAction: function (type, idStr) {
-            closeAllMessageMenus();
-            if (!type || idStr == null || idStr === '') return;
-            var s = String(idStr);
-            if (type === 'reply') {
-                var replyMsg = getMessageFromStateByWidgetId(s);
-                if (replyMsg) applyReplyToMessage(replyMsg);
-                return;
-            }
-            if (type === 'edit') {
-                var editMsg = getMessageFromStateByWidgetId(s);
-                if (editMsg && messageHasAudioOrVideoMedia(editMsg)) return;
-                widgetState.selectedMessageId = s;
-                this.footerActionEdit();
-                return;
-            }
-            if (type === 'delete') {
-                var delMsg = getMessageFromStateByWidgetId(s);
-                if (delMsg && messageHasAudioOrVideoMedia(delMsg)) return;
-                widgetState.selectedMessageId = s;
-                void this.footerActionDelete();
-            }
+            if (String(type) !== 'reply') return;
+            if (idStr == null || idStr === '') return;
+            var replyMsg = getMessageFromStateByWidgetId(String(idStr));
+            if (replyMsg) applyReplyToMessage(replyMsg);
         },
-        
+
         showScreen: async function(screen) {
             if (screen === 'messages' && !isDirectMessageEnabled(widgetState.widgetSettings)) {
                 screen = 'home';
@@ -7830,6 +7976,14 @@
         },
         
         showFileUploadPopup: function() {
+            if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) {
+                notifyUser('Media upload is disabled.');
+                return;
+            }
+            if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) {
+                notifyUser('This conversation is closed.');
+                return;
+            }
             const popup = document.getElementById('fileUploadPopup');
             if (popup) {
                 popup.classList.remove('hidden');
@@ -7905,6 +8059,10 @@
         
         
         handleFileSelect: function(event) {
+            if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) {
+                notifyUser('Media upload is disabled.');
+                return;
+            }
             let file = null;
             if (event.target && event.target.files && event.target.files.length > 0) {
                 file = event.target.files[0];
@@ -8569,9 +8727,42 @@
         }
     };
     
+    function bindSilentComposerMediaDrop() {
+        var targets = [
+            document.getElementById('messagesScreen'),
+            document.getElementById('inputContainer'),
+            document.getElementById('chatWidget')
+        ].filter(Boolean);
+        targets.forEach(function(el) {
+            if (el.getAttribute('data-cw-silent-drop') === '1') return;
+            el.setAttribute('data-cw-silent-drop', '1');
+            el.addEventListener('dragover', function(e) {
+                if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) return;
+                if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) return;
+                if (!e.dataTransfer) return;
+                var types = Array.prototype.slice.call(e.dataTransfer.types || []);
+                if (types.indexOf('Files') === -1) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+            }, false);
+            el.addEventListener('drop', function(e) {
+                if (typeof isMediaUploadEnabled === 'function' && !isMediaUploadEnabled()) return;
+                if (typeof isConversationReplyAllowed === 'function' && !isConversationReplyAllowed()) return;
+                var files = e.dataTransfer && e.dataTransfer.files;
+                if (!files || !files.length) return;
+                e.preventDefault();
+                e.stopPropagation();
+                if (window.chatWidget && typeof window.chatWidget.handleFileSelect === 'function') {
+                    window.chatWidget.handleFileSelect({ target: { files: files } });
+                }
+            }, false);
+        });
+    }
+
     function initializeWidget() {
         // Wait a bit to ensure DOM is fully updated
         setTimeout(function() {
+            try { bindSilentComposerMediaDrop(); } catch (eDrop) {}
             // Ensure header is hidden on home screen (initial state)
             const header = document.getElementById('mainHeader');
             const homeScreen = document.getElementById('homeScreen');
@@ -8594,22 +8785,29 @@
             const chatInput = document.getElementById('chatInput');
             if (chatInput) {
                 var typingPulseTimer = null;
-                var typingStopTimer = null;
+                var typingActive = false;
                 chatInput.addEventListener('input', function() {
                     this.style.height = 'auto';
                     this.style.height = this.scrollHeight + 'px';
                     if (window.chatWidget) {
                         window.chatWidget.toggleSendButton();
                     }
-                    if (widgetState.conversationNumber) {
+                    if (widgetState.conversationNumber && typeof isConversationReplyAllowed === 'function' && isConversationReplyAllowed()) {
                         if (typingPulseTimer) clearTimeout(typingPulseTimer);
                         typingPulseTimer = setTimeout(function() {
+                            typingActive = true;
                             void postVisitorTypingToApi(true);
                         }, 450);
-                        if (typingStopTimer) clearTimeout(typingStopTimer);
-                        typingStopTimer = setTimeout(function() {
-                            void postVisitorTypingToApi(false);
-                        }, 2200);
+                    }
+                });
+                chatInput.addEventListener('blur', function() {
+                    if (typingPulseTimer) {
+                        clearTimeout(typingPulseTimer);
+                        typingPulseTimer = null;
+                    }
+                    if (typingActive || widgetState.conversationNumber) {
+                        typingActive = false;
+                        void postVisitorTypingToApi(false);
                     }
                 });
                 if (window.chatWidget) {
