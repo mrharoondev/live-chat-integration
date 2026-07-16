@@ -725,15 +725,21 @@
             ch.bind('conversation-status-updated', function(data) {
                 if (!data || String(data.conversation_number) !== String(conv)) return;
                 widgetState.conversationStatus = data.status || null;
-                if (widgetState.visitorChatPolicy === 'multiple' && data.status === 'closed') {
+                if (data.status === 'closed') {
                     widgetState.canReply = false;
-                    if (widgetState.currentScreen === 'messages' && widgetState.messagesPane === 'conversation') {
-                        showChatClosedConfirmation();
-                        return;
-                    }
+                    appendConversationStatusSystemMessage(data);
+                    showChatClosedConfirmation();
                 } else if (data.status === 'open' || data.status === 'pending') {
                     widgetState.canReply = true;
+                    if (widgetState.messagesPane === 'closed') {
+                        widgetState.messagesPane = 'conversation';
+                        applyMessagesPaneView('conversation');
+                        if (Array.isArray(widgetState.messages)) {
+                            displayMessages(widgetState.messages);
+                        }
+                    }
                 }
+                if (typeof updateAssignedAgentBarUi === 'function') updateAssignedAgentBarUi();
                 if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
             });
             ch.bind('webrtc-signal', function(data) {
@@ -1164,8 +1170,27 @@
         return settings.show_agent_detail !== false;
     }
 
+    function getBrandLogoUrl() {
+        var settings = widgetState && widgetState.widgetSettings;
+        if (!settings || !settings.icon) return '';
+        var url = String(settings.icon).trim();
+        return url || '';
+    }
+
+    function isShowTypingIndicatorEnabled() {
+        var settings = widgetState && widgetState.widgetSettings;
+        if (!settings) return false;
+        return settings.show_typing_indicator === true;
+    }
+
+    function isShowCallIconEnabled() {
+        var settings = widgetState && widgetState.widgetSettings;
+        if (!settings) return true;
+        return settings.show_call_icon !== false;
+    }
+
     function isConversationReplyAllowed() {
-        if (widgetState.visitorChatPolicy === 'multiple' && widgetState.conversationStatus === 'closed') {
+        if (String(widgetState.conversationStatus || '').toLowerCase() === 'closed') {
             return false;
         }
         if (widgetState.canReply === false) return false;
@@ -1181,38 +1206,72 @@
             if (!allowed) input.placeholder = 'This conversation is closed';
             else if (typeof syncChatInputPlaceholder === 'function') syncChatInputPlaceholder();
         }
-        if (sendBtn && !allowed) sendBtn.disabled = true;
+        if (sendBtn) sendBtn.disabled = !allowed;
         var attachBtn = document.getElementById('cwComposerAttachBtn');
         var voiceBtn = document.getElementById('cwComposerVoiceBtn');
         var callBtn = document.getElementById('cwComposerCallBtn');
         if (attachBtn) attachBtn.disabled = !allowed || !isMediaUploadEnabled();
         if (voiceBtn) voiceBtn.disabled = !allowed || !isVoiceMessageEnabled();
-        if (callBtn && !allowed) callBtn.disabled = true;
+        if (!allowed) {
+            if (callBtn) callBtn.disabled = true;
+        } else if (typeof syncComposerVoiceCallButton === 'function') {
+            syncComposerVoiceCallButton();
+        }
+    }
 
-        // Multiple-chat: when the open thread is closed, show the confirmation screen.
-        if (
-            isMultipleChatPolicy() &&
-            !allowed &&
-            widgetState.currentScreen === 'messages' &&
-            (widgetState.messagesPane === 'conversation' || widgetState.messagesPane === 'closed')
-        ) {
-            showChatClosedConfirmation();
+    function appendConversationStatusSystemMessage(data) {
+        if (!data) return;
+        var text = data.message != null ? String(data.message).trim() : '';
+        if (!text) {
+            var status = String(data.status || '').toLowerCase();
+            var actor = data.actor_name != null ? String(data.actor_name).trim() : '';
+            if (status === 'closed') {
+                text = actor ? ('Conversation closed by ' + actor) : 'Conversation closed';
+            } else if (status === 'open') {
+                text = actor ? ('Conversation opened by ' + actor) : 'Conversation opened';
+            } else if (status === 'pending') {
+                text = actor ? ('Conversation marked as pending by ' + actor) : 'Conversation marked as pending';
+            } else {
+                return;
+            }
+        }
+        widgetState.messages = widgetState.messages || [];
+        // Avoid duplicate if a matching status log already exists at the end.
+        for (var i = widgetState.messages.length - 1; i >= 0 && i >= widgetState.messages.length - 3; i--) {
+            var existing = widgetState.messages[i];
+            if (existing && existing.status_log_tags && String(existing.message || '') === text) {
+                return;
+            }
+        }
+        var msg = {
+            id: 'status-rt-' + Date.now(),
+            message: text,
+            direction: 'system',
+            status_log_tags: true,
+            status_log_data: {
+                to_status: data.status || null,
+                created_at: new Date().toISOString()
+            },
+            created_at: new Date().toISOString()
+        };
+        widgetState.messages.push(msg);
+        var c = document.getElementById('messagesContainer');
+        if (c && widgetState.messagesPane === 'conversation' && widgetState.currentScreen === 'messages') {
+            var el = typeof renderMessage === 'function' ? renderMessage(msg) : null;
+            if (el) {
+                c.appendChild(el);
+                if (typeof scrollMessagesToBottom === 'function') scrollMessagesToBottom();
+            }
         }
     }
 
     function showChatClosedConfirmation() {
-        widgetState.messagesPane = 'closed';
         widgetState.canReply = false;
+        widgetState.conversationStatus = 'closed';
+        widgetState.messagesPane = 'closed';
         applyMessagesPaneView('closed');
-        stopMessagePolling();
-        var title = document.getElementById('widgetHeaderTitle');
-        var sub = document.getElementById('widgetHeaderSubtitle');
-        var avatarWrap = document.getElementById('cwHeaderAvatarWrap');
-        if (title) title.textContent = 'Messages';
-        if (sub) sub.textContent = '';
-        if (avatarWrap) avatarWrap.classList.add('hidden');
-        var bottomNav = document.getElementById('widgetBottomNav');
-        if (bottomNav) bottomNav.style.display = 'none';
+        if (typeof updateAssignedAgentBarUi === 'function') updateAssignedAgentBarUi();
+        if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
     }
 
     function syncComposerFeatureButtons() {
@@ -1786,7 +1845,7 @@
     function syncComposerVoiceCallButton() {
         var btn = document.getElementById('cwComposerCallBtn');
         if (!btn) return;
-        var enabled = isVoiceCallsEnabled();
+        var enabled = isVoiceCallsEnabled() && isShowCallIconEnabled();
         var inCall = Boolean(webrtcPeerConnection || webrtcPendingOffer || webrtcActiveCallId);
         var hasConversation = Boolean(widgetState.conversationNumber);
         var onMessages = widgetState.currentScreen === 'messages';
@@ -3444,6 +3503,14 @@
                 align-items: center;
                 justify-content: center;
                 box-shadow: 0 10px 25px -10px rgba(15, 23, 42, 0.25);
+                overflow: hidden;
+            }
+            .cw-home-logo-img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                border-radius: 999px;
+                display: block;
             }
             .cw-home-primary-btn:focus-visible,
             .cw-home-topic:focus-visible {
@@ -4313,8 +4380,9 @@
                         </div>
 
                         <div class="bg-white px-5 pb-5 pt-0 flex-1 rounded-t-[24px] -mt-[22px] relative flex flex-col min-h-0">
-                            <div class="cw-home-logo" aria-hidden="true">
-                                <svg class="w-7 h-7" viewBox="0 0 24 24" fill="none">
+                            <div class="cw-home-logo" id="widgetHomeLogoWrap" aria-hidden="true">
+                                <img id="widgetHomeLogo" class="cw-home-logo-img hidden" alt="" width="56" height="56" />
+                                <svg id="widgetHomeLogoFallback" class="w-7 h-7" viewBox="0 0 24 24" fill="none">
                                     <path d="M12 3a7 7 0 0 0-7 7v9" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/>
                                     <path d="M12 7a3 3 0 0 0-3 3v9" stroke="#0f172a" stroke-width="2" stroke-linecap="round"/>
                                     <circle cx="12" cy="12" r="2.5" fill="#0f172a"/>
@@ -5207,8 +5275,11 @@
 
     function applyConversationTypingFromRealtime(data) {
         if (!data || String(data.conversation_number) !== String(widgetState.conversationNumber)) return;
-        // Intentionally hide agent typing from the visitor widget.
-        if (data.actor === 'agent') {
+        // Visitor must never see their own typing echo — only real agent typing.
+        if (!data.actor || String(data.actor) !== 'agent') {
+            return;
+        }
+        if (!isShowTypingIndicatorEnabled()) {
             clearAgentTypingUi();
             return;
         }
@@ -5221,10 +5292,11 @@
             el.classList.remove('hidden');
             el.style.display = 'flex';
             placeTypingIndicatorUnderLastMessage();
-            if (agentTypingHideTimer) clearTimeout(agentTypingHideTimer);
-            agentTypingHideTimer = setTimeout(function() {
-                clearAgentTypingUi();
-            }, 8000);
+            // Keep visible until agent focus-out sends typing:false (no idle auto-hide).
+            if (agentTypingHideTimer) {
+                clearTimeout(agentTypingHideTimer);
+                agentTypingHideTimer = null;
+            }
         } else {
             clearAgentTypingUi();
         }
@@ -5280,13 +5352,21 @@
     }
 
     function buildInboundAvatarHtml() {
+        var brandLogo = getBrandLogoUrl();
+        // When agent details are hidden, still show the brand logo as the agent avatar.
         if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
-            return '';
+            if (brandLogo) {
+                return '<img class="cw-msg-avatar-img" src="' + escapeHtml(brandLogo) + '" alt="" width="28" height="28" loading="lazy" decoding="async"/>';
+            }
+            return '<svg viewBox="0 0 24 24" class="cw-msg-avatar-svg" aria-hidden="true"><path d="M12 12c2.8 0 5-2.2 5-5s-2.2-5-5-5-5 2.2-5 5 2.2 5 5 5zm0 2c-4.4 0-8 2.4-8 5.3V22h16v-2.7c0-2.9-3.6-5.3-8-5.3z" fill="rgba(0,0,0,0.35)"/></svg>';
         }
 
         var ag = widgetState && widgetState.assignedAgent;
         if (ag && ag.avatar_url) {
             return '<img class="cw-msg-avatar-img" src="' + escapeHtml(String(ag.avatar_url)) + '" alt="" width="28" height="28" loading="lazy" decoding="async"/>';
+        }
+        if (brandLogo) {
+            return '<img class="cw-msg-avatar-img" src="' + escapeHtml(brandLogo) + '" alt="" width="28" height="28" loading="lazy" decoding="async"/>';
         }
         return '<svg viewBox="0 0 24 24" class="cw-msg-avatar-svg" aria-hidden="true"><path d="M12 12c2.8 0 5-2.2 5-5s-2.2-5-5-5-5 2.2-5 5 2.2 5 5 5zm0 2c-4.4 0-8 2.4-8 5.3V22h16v-2.7c0-2.9-3.6-5.3-8-5.3z" fill="rgba(0,0,0,0.35)"/></svg>';
     }
@@ -5441,14 +5521,28 @@
         return wrap;
     }
 
+    function renderSystemStatusLogMessage(message) {
+        var text = message && message.message != null ? String(message.message).trim() : '';
+        if (!text) return null;
+        var wrap = document.createElement('div');
+        wrap.className = 'cw-msg-wrap cw-msg-system w-full max-w-full animate-fade-in';
+        if (message && message.id != null) {
+            wrap.setAttribute('data-message-id', String(message.id));
+        }
+        wrap.innerHTML = '<div class="cw-system-pill">' + escapeHtml(text) + '</div>';
+        return wrap;
+    }
+
     function renderMessage(message) {
         var dir0 = message && message.direction ? String(message.direction).toLowerCase() : '';
+        if (message && message.status_log_tags) {
+            return renderSystemStatusLogMessage(message);
+        }
         var isTimeline =
             dir0 === 'system' ||
-            (message && message.assignment_tags) ||
-            (message && message.status_log_tags);
+            (message && message.assignment_tags);
         if (isTimeline) {
-            // Status / assignment logs are intentionally hidden in the visitor widget.
+            // Assignment logs stay hidden in the visitor widget.
             return null;
         }
 
@@ -5870,15 +5964,18 @@
 
     /** Messages header: agent avatar + name (Preline-style). */
     function syncWidgetMessagesHeaderForAssignee() {
+        var isClosed = String(widgetState.conversationStatus || '').toLowerCase() === 'closed';
         if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
             var titleEl0 = document.getElementById('widgetHeaderTitle');
             var subEl0 = document.getElementById('widgetHeaderSubtitle');
-            var wrap0 = document.getElementById('cwHeaderAvatarWrap');
             if (titleEl0 && widgetState.widgetSettings) {
                 titleEl0.textContent = widgetState.widgetSettings.brand_name || 'Chat';
             }
-            if (subEl0) subEl0.textContent = isWidgetBusinessOnline() ? 'Online' : 'Away';
-            if (wrap0) wrap0.classList.add('hidden');
+            if (subEl0) {
+                subEl0.textContent = isClosed ? '' : (isWidgetBusinessOnline() ? 'Online' : 'Away');
+                if (isClosed) subEl0.classList.add('hidden');
+                else subEl0.classList.remove('hidden');
+            }
             return;
         }
 
@@ -5895,12 +5992,42 @@
         if (!ag || !ag.name) {
             var bn = (widgetState.widgetSettings && widgetState.widgetSettings.brand_name) ? String(widgetState.widgetSettings.brand_name) : 'Chat';
             title.textContent = bn;
-            sub.textContent = isWidgetBusinessOnline() ? 'Online' : 'Away';
+            sub.textContent = isClosed ? '' : (isWidgetBusinessOnline() ? 'Online' : 'Away');
+            if (isClosed) sub.classList.add('hidden');
+            else sub.classList.remove('hidden');
             return;
         }
         var online = pr && String(pr.state).toLowerCase() === 'online';
         title.textContent = String(ag.name);
-        sub.textContent = online ? 'Online' : 'Away';
+        sub.textContent = isClosed ? '' : (online ? 'Online' : 'Away');
+        if (isClosed) sub.classList.add('hidden');
+        else sub.classList.remove('hidden');
+    }
+
+    function applyBrandLogoToHeaderAvatar(wrap, img, dot, online) {
+        if (!wrap || !img) return;
+        var brandLogo = getBrandLogoUrl();
+        var ph = document.getElementById('cwHeaderAvatarPlaceholder');
+        var isClosed = String(widgetState.conversationStatus || '').toLowerCase() === 'closed';
+        wrap.classList.remove('hidden');
+        if (brandLogo) {
+            if (ph) ph.classList.add('hidden');
+            img.src = brandLogo;
+            img.alt = '';
+            img.classList.remove('hidden');
+        } else {
+            img.removeAttribute('src');
+            img.classList.add('hidden');
+            if (ph) ph.classList.remove('hidden');
+        }
+        if (dot) {
+            if (isClosed) {
+                dot.classList.add('hidden');
+            } else {
+                dot.classList.remove('hidden');
+                dot.classList.toggle('cw-away', !online);
+            }
+        }
     }
 
     function updateAssignedAgentBarUi() {
@@ -5910,13 +6037,20 @@
         var wrap = document.getElementById('cwHeaderAvatarWrap');
         var img = document.getElementById('cwHeaderAvatarImg');
         var dot = document.getElementById('cwHeaderPresenceDot');
+        var mc0 = document.getElementById('messagesContainer');
+        var onMessages = mc0 && mc0.style.display !== 'none' && !mc0.classList.contains('hidden');
+        var onList = widgetState.messagesPane === 'list';
 
         if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
-            if (wrap) wrap.classList.add('hidden');
             var barHide = document.getElementById('assignedAgentBar');
             if (barHide) {
                 barHide.classList.add('hidden');
                 barHide.style.display = 'none';
+            }
+            if (wrap && img && (onMessages || onList)) {
+                applyBrandLogoToHeaderAvatar(wrap, img, dot, isWidgetBusinessOnline());
+            } else if (wrap) {
+                wrap.classList.add('hidden');
             }
             return;
         }
@@ -5938,16 +6072,10 @@
                 av.removeAttribute('src');
             }
             var ph = document.getElementById('cwHeaderAvatarPlaceholder');
-            var mc0 = document.getElementById('messagesContainer');
-            var onMessages = mc0 && mc0.style.display !== 'none' && !mc0.classList.contains('hidden');
             if (wrap && img && dot) {
                 var onlineBiz = isWidgetBusinessOnline();
-                if (onMessages) {
-                    wrap.classList.remove('hidden');
-                    img.classList.add('hidden');
-                    img.removeAttribute('src');
-                    if (ph) ph.classList.remove('hidden');
-                    dot.classList.toggle('cw-away', !onlineBiz);
+                if (onMessages || onList) {
+                    applyBrandLogoToHeaderAvatar(wrap, img, dot, onlineBiz);
                 } else {
                     wrap.classList.add('hidden');
                     if (ph) ph.classList.add('hidden');
@@ -5958,15 +6086,18 @@
 
         nameEl.textContent = String(ag.name);
         var online = pr && String(pr.state).toLowerCase() === 'online';
-        statusEl.textContent = online ? 'Online' : 'Offline';
-        statusEl.className = 'text-[11px] leading-tight mt-0.5 ' + (online ? 'text-emerald-600 font-medium' : 'text-[var(--text-color)] opacity-65');
+        var isClosedConv = String(widgetState.conversationStatus || '').toLowerCase() === 'closed';
+        statusEl.textContent = isClosedConv ? '' : (online ? 'Online' : 'Offline');
+        statusEl.className = 'text-[11px] leading-tight mt-0.5 ' + (isClosedConv ? 'hidden' : (online ? 'text-emerald-600 font-medium' : 'text-[var(--text-color)] opacity-65'));
 
         var mc = document.getElementById('messagesContainer');
         if (!mc || mc.style.display === 'none' || mc.classList.contains('hidden')) {
-            bar.classList.add('hidden');
-            bar.style.display = 'none';
-            if (wrap) wrap.classList.add('hidden');
-            return;
+            if (!onList) {
+                bar.classList.add('hidden');
+                bar.style.display = 'none';
+                if (wrap) wrap.classList.add('hidden');
+                return;
+            }
         }
 
         if (av) {
@@ -5983,19 +6114,30 @@
         }
 
         if (wrap && img && dot) {
-            var ph = document.getElementById('cwHeaderAvatarPlaceholder');
+            var ph2 = document.getElementById('cwHeaderAvatarPlaceholder');
+            var brandLogo = getBrandLogoUrl();
             wrap.classList.remove('hidden');
             if (ag.avatar_url) {
-                if (ph) ph.classList.add('hidden');
+                if (ph2) ph2.classList.add('hidden');
                 img.src = String(ag.avatar_url);
+                img.alt = '';
+                img.classList.remove('hidden');
+            } else if (brandLogo) {
+                if (ph2) ph2.classList.add('hidden');
+                img.src = brandLogo;
                 img.alt = '';
                 img.classList.remove('hidden');
             } else {
                 img.removeAttribute('src');
                 img.classList.add('hidden');
-                if (ph) ph.classList.remove('hidden');
+                if (ph2) ph2.classList.remove('hidden');
             }
-            dot.classList.toggle('cw-away', !online);
+            if (isClosedConv) {
+                dot.classList.add('hidden');
+            } else {
+                dot.classList.remove('hidden');
+                dot.classList.toggle('cw-away', !online);
+            }
         }
 
         bar.classList.remove('hidden');
@@ -6578,13 +6720,21 @@
         
         var logoWrap = document.getElementById('widgetHomeLogoWrap');
         var logo = document.getElementById('widgetHomeLogo');
-        if (settings.icon && logo && logoWrap) {
-            logo.src = settings.icon;
-            logo.alt = '';
+        var logoFallback = document.getElementById('widgetHomeLogoFallback');
+        if (logoWrap) {
             logoWrap.classList.remove('hidden');
-        } else if (logoWrap) {
-            logoWrap.classList.add('hidden');
-            if (logo) logo.removeAttribute('src');
+            if (settings.icon && logo) {
+                logo.src = settings.icon;
+                logo.alt = '';
+                logo.classList.remove('hidden');
+                if (logoFallback) logoFallback.classList.add('hidden');
+            } else {
+                if (logo) {
+                    logo.classList.add('hidden');
+                    logo.removeAttribute('src');
+                }
+                if (logoFallback) logoFallback.classList.remove('hidden');
+            }
         }
         
         var kb = document.getElementById('widgetKnowledgeBaseRow');
@@ -6819,6 +6969,11 @@
     }
 
     function conversationListTitle(conv, index) {
+        if (typeof isShowAgentDetailEnabled === 'function' && !isShowAgentDetailEnabled()) {
+            var bn = widgetState && widgetState.widgetSettings && widgetState.widgetSettings.brand_name;
+            if (bn && String(bn).trim()) return String(bn).trim();
+            return 'Support';
+        }
         var name = conv && conv.agent_name ? String(conv.agent_name).trim() : '';
         if (name) return name;
         return 'Support team';
@@ -6915,8 +7070,14 @@
                 : '';
             var closedBadge = isClosed ? '<span class="cw-inbox-status-badge">Closed</span>' : '';
             var avatarHtml;
-            if (conv.agent_avatar_url) {
+            var brandLogo = getBrandLogoUrl();
+            var showAgentDetail = typeof isShowAgentDetailEnabled !== 'function' || isShowAgentDetailEnabled();
+            if (!showAgentDetail && brandLogo) {
+                avatarHtml = '<span class="cw-inbox-avatar"><img src="' + escapeHtml(brandLogo) + '" alt="" /></span>';
+            } else if (showAgentDetail && conv.agent_avatar_url) {
                 avatarHtml = '<span class="cw-inbox-avatar"><img src="' + escapeHtml(String(conv.agent_avatar_url)) + '" alt="" /></span>';
+            } else if (brandLogo) {
+                avatarHtml = '<span class="cw-inbox-avatar"><img src="' + escapeHtml(brandLogo) + '" alt="" /></span>';
             } else {
                 var hue = conversationAvatarHue(conv.number || titleRaw);
                 avatarHtml = '<span class="cw-inbox-avatar" style="background:hsl(' + hue + ' 70% 48%)">' +
@@ -7155,6 +7316,11 @@
 
     function finalizeConversationPane(messages) {
         var list = messages != null ? messages : (widgetState.messages || []);
+        var isClosed = String(widgetState.conversationStatus || '').toLowerCase() === 'closed';
+        if (isClosed) {
+            showChatClosedConfirmation();
+            return;
+        }
         displayMessages(list);
         markThreadAsSeen(list);
         updateAssignedAgentBarUi();
@@ -7301,6 +7467,63 @@
             throw err;
         }
         return response.json();
+    }
+
+    /**
+     * Only retry sends that are safe to repeat without duplicating a saved message.
+     * Never retry unbounded: a prior attempt may already have been stored server-side.
+     */
+    function isRetryableSendError(error) {
+        var status = error && typeof error === 'object' ? error.status : null;
+        if (status === 429 || status === 502 || status === 503 || status === 504) {
+            return true;
+        }
+        // Network / abort / CORS: fetch rejects with no HTTP status.
+        if (status == null && error instanceof TypeError) {
+            return true;
+        }
+        var msg = error && typeof error === 'object' && error.message ? String(error.message) : '';
+        var lower = msg.toLowerCase();
+        if (status === 429 || lower.indexOf('too many') !== -1) {
+            return true;
+        }
+        if (!status && (lower.indexOf('network') !== -1 || lower.indexOf('failed to fetch') !== -1)) {
+            return true;
+        }
+        return false;
+    }
+
+    var SEND_MAX_ATTEMPTS = 4;
+
+    function scheduleSendRetry(trySendFn, attempt, error, timeContainer) {
+        var nextAttempt = (attempt || 0) + 1;
+        if (nextAttempt >= SEND_MAX_ATTEMPTS || !isRetryableSendError(error)) {
+            if (timeContainer) {
+                try {
+                    var failedClock = formatMessageClock(new Date().toISOString());
+                    timeContainer.className = 'cw-time cw-bubble-footer';
+                    timeContainer.title = 'Failed to send';
+                    timeContainer.innerHTML = escapeHtml(failedClock);
+                } catch (e) {}
+            }
+            try {
+                var cfg = getApiConfig();
+                if (cfg && cfg.onNotify) {
+                    cfg.onNotify('Message could not be sent. Please try again.');
+                }
+            } catch (e2) {}
+            return;
+        }
+        if (timeContainer) {
+            timeContainer.innerHTML = '<span class="cw-status-sending" title="Sending" aria-label="Sending"></span>';
+        }
+        var status = error && typeof error === 'object' ? error.status : null;
+        var isThrottle = status === 429;
+        var base = isThrottle ? 1200 : 800;
+        var delay = Math.min(30000, base * Math.pow(2, Math.min(nextAttempt, 5)));
+        setTimeout(function () {
+            void trySendFn(nextAttempt);
+        }, delay);
     }
 
     async function sendMessageToAPI(messageText, formData = {}, attachments = {}, opts = {}) {
@@ -7860,92 +8083,70 @@
                             sendOpts.in_reply_of = String(widgetState.pendingInReplyOf);
                         }
                         const response = await sendMessageToAPI(messageText, {}, {}, sendOpts);
-                        if (sendOpts.in_reply_of) {
-                            widgetState.pendingInReplyOf = null;
-                            var rbp2 = document.getElementById('cwReplyBarPreview');
-                            if (rbp2) rbp2.textContent = '';
-                            syncReplyBarVisibility(false);
-                            updateMessageSelectionUi();
-                        }
-                        if (response && response.token) {
-                            saveSessionToken(response.token);
-                        }
-                        if (response && Object.prototype.hasOwnProperty.call(response, 'conversation_number')) {
-                            widgetState.conversationNumber = response.conversation_number;
-                            if (response.conversation_number) {
-                                widgetState.selectedConversationNumber = String(response.conversation_number);
+                        // Message is already stored server-side — never retry from here.
+                        try {
+                            if (sendOpts.in_reply_of) {
+                                widgetState.pendingInReplyOf = null;
+                                var rbp2 = document.getElementById('cwReplyBarPreview');
+                                if (rbp2) rbp2.textContent = '';
+                                syncReplyBarVisibility(false);
+                                updateMessageSelectionUi();
                             }
-                        }
-                        if (response && response.is_new_conversation) {
-                            widgetState.messages = [];
-                        }
-                        syncAssignedAgentFromPayload(response || {});
-                        clearAgentTypingUi();
-                        void postVisitorTypingToApi(false);
+                            if (response && response.token) {
+                                saveSessionToken(response.token);
+                            }
+                            if (response && Object.prototype.hasOwnProperty.call(response, 'conversation_number')) {
+                                widgetState.conversationNumber = response.conversation_number;
+                                if (response.conversation_number) {
+                                    widgetState.selectedConversationNumber = String(response.conversation_number);
+                                }
+                            }
+                            if (response && response.is_new_conversation) {
+                                widgetState.messages = [];
+                            }
+                            syncAssignedAgentFromPayload(response || {});
+                            clearAgentTypingUi();
+                            void postVisitorTypingToApi(false);
 
-                        // Merge server message into cache so WebSocket broadcast does not treat it as "new"
-                        if (response && response.message) {
-                            var sm = response.message;
-                            widgetState.messages = widgetState.messages || [];
-                            var real = {
-                                id: sm.id,
-                                message: sm.message,
-                                direction: sm.direction || 'outgoing',
-                                created_at: sm.created_at,
-                                status: sm.status || 'Received',
-                                read_at: sm.read_at || null,
-                                in_reply_of: sm.in_reply_of != null ? sm.in_reply_of : null
-                            };
-                            widgetState.messages.push(real);
-                            setLastSeenMessageId(sm.id);
-                            await syncLiveChatRealtimeSubscription();
-                            displayMessages(widgetState.messages);
-                        } else {
-                            if (timeContainer) {
-                                var sentClock = formatMessageClock(new Date().toISOString());
-                                timeContainer.className = 'cw-time cw-bubble-footer';
-                                timeContainer.title = '';
-                                timeContainer.innerHTML = escapeHtml(sentClock);
+                            // Merge server message into cache so WebSocket broadcast does not treat it as "new"
+                            if (response && response.message) {
+                                var sm = response.message;
+                                widgetState.messages = widgetState.messages || [];
+                                var real = {
+                                    id: sm.id,
+                                    message: sm.message,
+                                    direction: sm.direction || 'outgoing',
+                                    created_at: sm.created_at,
+                                    status: sm.status || 'Received',
+                                    read_at: sm.read_at || null,
+                                    in_reply_of: sm.in_reply_of != null ? sm.in_reply_of : null
+                                };
+                                widgetState.messages.push(real);
+                                setLastSeenMessageId(sm.id);
+                                await syncLiveChatRealtimeSubscription();
+                                displayMessages(widgetState.messages);
+                            } else {
+                                if (timeContainer) {
+                                    var sentClock = formatMessageClock(new Date().toISOString());
+                                    timeContainer.className = 'cw-time cw-bubble-footer';
+                                    timeContainer.title = '';
+                                    timeContainer.innerHTML = escapeHtml(sentClock);
+                                }
+                                if (widgetState.messages) {
+                                    widgetState.messages.push({
+                                        id: messageId,
+                                        message: messageText,
+                                        direction: 'outgoing',
+                                        created_at: new Date().toISOString()
+                                    });
+                                }
                             }
-                            if (widgetState.messages) {
-                                widgetState.messages.push({
-                                    id: messageId,
-                                    message: messageText,
-                                    direction: 'outgoing',
-                                    created_at: new Date().toISOString()
-                                });
-                            }
+                        } catch (afterSendErr) {
+                            cwError('ChatWidget: post-send UI update failed', afterSendErr);
                         }
-
                         return;
                     } catch (error) {
-                        const status = error && typeof error === 'object' ? error.status : null;
-                        const body = error && typeof error === 'object' ? error.body : null;
-                        const msg = error && typeof error === 'object' && error.message ? String(error.message) : '';
-                        const isThrottle =
-                            status === 429 ||
-                            msg.toLowerCase().includes('too many') ||
-                            (body && typeof body === 'object' && String(body.error || body.message || '').toLowerCase().includes('too many'));
-
-                        // Do not show an error to the visitor; keep retrying quietly.
-                        if (timeContainer) {
-                            timeContainer.innerHTML = '<span class="cw-status-sending" title="Sending" aria-label="Sending"></span>';
-                        }
-                        if (attempt >= 2) {
-                            try {
-                                var retryCfg = getApiConfig();
-                                if (retryCfg.onNotify) {
-                                    retryCfg.onNotify('Message is still sending. Check that the chat API is reachable.');
-                                }
-                            } catch (e) {}
-                        }
-
-                        const nextAttempt = (attempt || 0) + 1;
-                        const base = isThrottle ? 1200 : 800;
-                        const delay = Math.min(30000, base * Math.pow(2, Math.min(nextAttempt, 5)));
-                        setTimeout(function() {
-                            void trySend(nextAttempt);
-                        }, delay);
+                        scheduleSendRetry(trySend, attempt, error, timeContainer);
                     }
                 };
 
@@ -8461,18 +8662,13 @@
                 widgetState.messages = list;
                 widgetState.messagesLoaded = true;
                 widgetState.conversationNumber = (data && data.conversation_number) || String(conversationNumber);
-                if (
-                    isMultipleChatPolicy() &&
-                    (widgetState.conversationStatus === 'closed' || widgetState.canReply === false)
-                ) {
-                    showChatClosedConfirmation();
-                    return;
-                }
+                // Closed chats stay open as read-only history (composer disabled).
                 applyMessagesPaneView('conversation');
                 finalizeConversationPane(list);
                 startMessagePolling(5000);
                 void syncLiveChatRealtimeSubscription();
                 syncComposerVoiceCallButton();
+                if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
             } catch (e) {
                 cwError('ChatWidget: openConversation failed', e);
                 notifyUser('Could not open that conversation.');
@@ -8739,17 +8935,7 @@
                                 });
                                 return;
                             } catch (error) {
-                                const status = error && typeof error === 'object' ? error.status : null;
-                                const body = error && typeof error === 'object' ? error.body : null;
-                                const msg = error && typeof error === 'object' && error.message ? String(error.message) : '';
-                                const isThrottle =
-                                    status === 429 ||
-                                    msg.toLowerCase().includes('too many') ||
-                                    (body && typeof body === 'object' && String(body.error || body.message || '').toLowerCase().includes('too many'));
-                                const nextAttempt = (attempt || 0) + 1;
-                                const base = isThrottle ? 1200 : 800;
-                                const delay = Math.min(30000, base * Math.pow(2, Math.min(nextAttempt, 5)));
-                                setTimeout(function() { void trySend(nextAttempt); }, delay);
+                                scheduleSendRetry(trySend, attempt, error, null);
                             }
                         };
                         void trySend(0);
@@ -9354,17 +9540,7 @@
                         await sendMessageToAPI('', {}, attachments);
                         return;
                     } catch (error) {
-                        const status = error && typeof error === 'object' ? error.status : null;
-                        const body = error && typeof error === 'object' ? error.body : null;
-                        const msg = error && typeof error === 'object' && error.message ? String(error.message) : '';
-                        const isThrottle =
-                            status === 429 ||
-                            msg.toLowerCase().includes('too many') ||
-                            (body && typeof body === 'object' && String(body.error || body.message || '').toLowerCase().includes('too many'));
-                        const nextAttempt = (attempt || 0) + 1;
-                        const base = isThrottle ? 1200 : 800;
-                        const delay = Math.min(30000, base * Math.pow(2, Math.min(nextAttempt, 5)));
-                        setTimeout(function() { void trySend(nextAttempt); }, delay);
+                        scheduleSendRetry(trySend, attempt, error, null);
                     }
                 };
                 void trySend(0);
