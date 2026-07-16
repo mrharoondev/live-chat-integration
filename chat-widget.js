@@ -7317,12 +7317,13 @@
     function finalizeConversationPane(messages) {
         var list = messages != null ? messages : (widgetState.messages || []);
         var isClosed = String(widgetState.conversationStatus || '').toLowerCase() === 'closed';
-        if (isClosed) {
-            showChatClosedConfirmation();
-            return;
-        }
+        widgetState.messagesPane = 'conversation';
+        applyMessagesPaneView('conversation');
         displayMessages(list);
         markThreadAsSeen(list);
+        if (isClosed) {
+            widgetState.canReply = false;
+        }
         updateAssignedAgentBarUi();
         if (typeof syncComposerFeatureButtons === 'function') syncComposerFeatureButtons();
         else syncComposerVoiceCallButton();
