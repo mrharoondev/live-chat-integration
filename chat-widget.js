@@ -4547,8 +4547,8 @@
 
                             <div class="cw-prechat-body">
                                 <div>
-                                    <p class="cw-prechat-intro-title" id="cwFormTitle">Send a message</p>
-                                    <p class="cw-prechat-intro-sub" id="cwFormSubtitle">We'll get back to you in a few hours.</p>
+                                    <p class="cw-prechat-intro-title" id="cwFormTitle">Get started</p>
+                                    <p class="cw-prechat-intro-sub" id="cwFormSubtitle">Share your name and email or phone number.</p>
                                 </div>
 
                                 <form id="contactForm" onsubmit="chatWidget.handleFormSubmit(event)" class="cw-prechat-form">
@@ -4564,21 +4564,7 @@
                                         <label class="cw-prechat-label" for="formPhone">Phone</label>
                                         <input type="tel" id="formPhone" class="cw-prechat-input" placeholder="Your phone number">
                                     </div>
-                                    <div class="cw-prechat-field" id="formMessageRow">
-                                        <label class="cw-prechat-label" for="formMessage">How can we help?</label>
-                                        <div class="cw-prechat-message-box">
-                                            <textarea id="formMessage" class="cw-prechat-textarea" placeholder="Message..." rows="3" required></textarea>
-                                            <div class="cw-prechat-textarea-toolbar">
-                                                <button type="button" title="Attach file" aria-label="Attach file" onclick="chatWidget.showFileUploadPopup()">
-                                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-                                                </button>
-                                                <button type="button" id="cwFormEmojiBtn" title="Add emoji" aria-label="Add emoji" onclick="chatWidget.toggleEmojiPicker()">
-                                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/><path d="M16 5h6"/><path d="M19 2v6"/></svg>
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <button type="submit" class="cw-prechat-submit" id="formSubmitButton">Send us a message</button>
+                                    <button type="submit" class="cw-prechat-submit" id="formSubmitButton">Continue</button>
                                 </form>
                             </div>
                         </div>
@@ -7371,9 +7357,6 @@
         const nameField = document.getElementById('formName');
         const emailField = document.getElementById('formEmail');
         const phoneField = document.getElementById('formPhone');
-        const messageField = document.getElementById('formMessage');
-        
-        const messageRow = document.getElementById('formMessageRow');
         
         if (nameField) {
             const nameContainer = document.getElementById('formNameRow');
@@ -7413,13 +7396,66 @@
                 }
             }
         }
-
-        if (messageField && messageRow) {
-            messageRow.style.display = 'flex';
-            messageField.required = true;
-        }
     }
     
+    async function registerContactToAPI(formData = {}) {
+        const session = await initializeChatSession();
+        if (!session || !session.token) {
+            throw new Error('No session token available');
+        }
+        const visitorId = session.visitor_id || getVisitorId();
+        const requestBody = {};
+        if (formData.name) requestBody.name = formData.name;
+        if (formData.email) requestBody.email = formData.email;
+        if (formData.phone) requestBody.phone = formData.phone;
+
+        const response = await fetch(getLivechatVisitorApiUrl('contact', visitorId), {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + session.token,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+            const errorBody = await response.json().catch(() => ({}));
+            if (response.status === 401) {
+                const storageKey = getStorageKey(STORAGE_SESSION_TOKEN_KEY);
+                localStorage.removeItem(storageKey);
+                const newSession = await initializeChatSession(true);
+                if (newSession && newSession.token) {
+                    const retryResponse = await fetch(getLivechatVisitorApiUrl('contact', newSession.visitor_id), {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': 'Bearer ' + newSession.token,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(requestBody)
+                    });
+                    if (retryResponse.ok) {
+                        const retryData = await retryResponse.json();
+                        if (retryData.token) {
+                            saveSessionToken(retryData.token);
+                        }
+                        return retryData;
+                    }
+                }
+            }
+            const err = new Error((errorBody && errorBody.message) ? String(errorBody.message) : `HTTP error! status: ${response.status}`);
+            err.status = response.status;
+            err.body = errorBody;
+            throw err;
+        }
+
+        const data = await response.json();
+        if (data.token) {
+            saveSessionToken(data.token);
+        }
+        void postVisitorPresence('online');
+        return data;
+    }
+
     async function editVisitorMessageApi(messageNo, text) {
         const session = await initializeChatSession();
         if (!session || !session.token) {
@@ -8890,89 +8926,68 @@
             const nameField = document.getElementById('formName');
             const emailField = document.getElementById('formEmail');
             const phoneField = document.getElementById('formPhone');
-            const messageField = document.getElementById('formMessage');
             
             const name = nameField ? nameField.value.trim() : '';
             const email = emailField ? emailField.value.trim() : '';
             const phone = phoneField ? phoneField.value.trim() : '';
-            const message = messageField ? messageField.value.trim() : '';
             
-            // Check if required fields are filled (only check fields that are visible/required)
             let isValid = true;
-            // Message is required
-            if (!message) isValid = false;
             if (nameField && nameField.required && !name) isValid = false;
             if (emailField && emailField.required && !email) isValid = false;
             if (phoneField && phoneField.required && !phone) isValid = false;
+
+            var emailRow = document.getElementById('formEmailRow');
+            var phoneRow = document.getElementById('formPhoneRow');
+            var emailVisible = emailRow && emailRow.style.display !== 'none';
+            var phoneVisible = phoneRow && phoneRow.style.display !== 'none';
+            if (emailVisible && phoneVisible && !email && !phone) isValid = false;
+            else if (emailVisible && !phoneVisible && !email) isValid = false;
+            else if (phoneVisible && !emailVisible && !phone) isValid = false;
             
-            if (isValid && message) {
-                // Store in sessionStorage for this session only
-                sessionStorage.setItem('chatWidgetFormSubmitted', 'true');
-                if (name) sessionStorage.setItem('chatWidgetUserName', name);
-                if (email) sessionStorage.setItem('chatWidgetUserEmail', email);
-                if (phone) sessionStorage.setItem('chatWidgetUserPhone', phone);
+            if (!isValid) return;
+
+            sessionStorage.setItem('chatWidgetFormSubmitted', 'true');
+            if (name) sessionStorage.setItem('chatWidgetUserName', name);
+            if (email) sessionStorage.setItem('chatWidgetUserEmail', email);
+            if (phone) sessionStorage.setItem('chatWidgetUserPhone', phone);
+            
+            const formContainer = document.getElementById('formContainer');
+            const submitButton = document.getElementById('formSubmitButton');
+            
+            if (formContainer) {
+                if (submitButton) {
+                    submitButton.disabled = true;
+                    submitButton.textContent = 'Saving...';
+                }
                 
-                const formContainer = document.getElementById('formContainer');
-                const messagesContainer = document.getElementById('messagesContainer');
-                const input = document.getElementById('inputContainer');
-                
-                if (formContainer && messagesContainer && input) {
-                    // Disable submit button while sending
-                    const submitButton = document.getElementById('formSubmitButton');
-                    if (submitButton) {
-                        submitButton.disabled = true;
-                        submitButton.textContent = 'Sending...';
-                    }
+                try {
+                    await registerContactToAPI({
+                        name: name || undefined,
+                        email: email || undefined,
+                        phone: phone || undefined
+                    });
                     
-                    // Send message with form data (message is required)
-                    try {
-                        // Do not block the user flow with errors; send and retry silently if throttled/network.
-                        const trySend = async (attempt) => {
-                            try {
-                                await sendMessageToAPI(message, {
-                                    name: name || undefined,
-                                    email: email || undefined,
-                                    phone: phone || undefined
-                                });
-                                return;
-                            } catch (error) {
-                                scheduleSendRetry(trySend, attempt, error, null);
-                            }
-                        };
-                        void trySend(0);
-                        
-                        // On successful send, hide form and show messages
-                        formContainer.classList.remove('active');
-                        widgetState.messagesPane = 'conversation';
-                        applyMessagesPaneView('conversation');
-                        
-                        // Fetch and display messages from API
-                        const messagesData = await fetchMessages();
-                        
-                        // Update cached state
-                        widgetState.messages = messagesData.messages;
-                        widgetState.conversationNumber = messagesData.conversation_number;
-                        widgetState.selectedConversationNumber = messagesData.conversation_number || null;
-                        widgetState.messagesLoaded = true;
-                        widgetState.formRequired = false;
-                        
-                        finalizeConversationPane(messagesData.messages);
-                    } catch (error) {
-                        cwError('Error sending form message:', error);
-                        // Re-enable submit button on error
-                        if (submitButton) {
-                            submitButton.disabled = false;
-                            submitButton.textContent = 'Send us a message';
-                        }
-                        // Do not show a blocking error to the visitor; keep UI responsive.
-                        return;
-                    }
+                    widgetState.conversationNumber = null;
+                    widgetState.selectedConversationNumber = null;
+                    widgetState.messages = [];
+                    widgetState.messagesLoaded = true;
+                    widgetState.formRequired = false;
+                    widgetState.messagesPane = 'conversation';
                     
-                    // Re-enable submit button
+                    finalizeConversationPane([]);
+                    startMessagePolling(5000);
+                } catch (error) {
+                    cwError('Error registering contact:', error);
                     if (submitButton) {
                         submitButton.disabled = false;
-                        submitButton.textContent = 'Send us a message';
+                        submitButton.textContent = 'Continue';
                     }
+                    return;
+                }
+                
+                if (submitButton) {
+                    submitButton.disabled = false;
+                    submitButton.textContent = 'Continue';
                 }
             }
         },
@@ -9696,10 +9711,7 @@
         },
         
         insertEmoji: function(emoji) {
-            var fc = document.getElementById('formContainer');
-            var formMsg = document.getElementById('formMessage');
-            var formOpen = fc && !fc.classList.contains('hidden') && fc.style.display !== 'none';
-            var textarea = (formOpen && formMsg) ? formMsg : document.getElementById('chatInput');
+            var textarea = document.getElementById('chatInput');
             if (!textarea) return;
             
             const start = textarea.selectionStart;
